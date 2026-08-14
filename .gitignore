@@ -1,0 +1,6 @@
+native/quickjs/libquickjs_bridge.so
+.dart_tool/
+.pub-cache/
+*.iml
+.pub
+/build
