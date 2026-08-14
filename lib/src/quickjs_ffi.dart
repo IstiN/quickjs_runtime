@@ -11,6 +11,7 @@
 /// path.
 library;
 
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
 
@@ -23,24 +24,51 @@ typedef _HostCallbackNative = Pointer<Utf8> Function(Pointer<Utf8> argsJson);
 
 /// Resolves the absolute path to `libquickjs_bridge.so`.
 ///
-/// Looks in (1) the `JSR_QUICKJS_LIB` env var and (2) the current working
-/// directory (git dependencies and vendored checkouts both resolve from
-/// there). Returns the first existing candidate so the same code resolves
-/// under `dart run`, `dart test` and `flutter test`.
+/// Looks in (1) the `JSR_QUICKJS_LIB` env var, (2) this package's checkout
+/// as recorded in the current `.dart_tool/package_config.json` (covers
+/// `dart run`/`dart test`/`flutter test` in any app that depends on the
+/// package), (3) relative to [Platform.script] and (4) the current working
+/// directory (source checkouts that vendor the build output). Returns the
+/// first existing candidate so the DynamicLibrary.open error carries a
+/// recognizable path.
 String _resolveLibraryPath() {
   final envOverride = Platform.environment['JSR_QUICKJS_LIB'];
   if (envOverride != null && envOverride.isNotEmpty) return envOverride;
 
   final candidates = <String>[
-    '${Directory.current.path}/native/quickjs/libquickjs_bridge.so',
+    ...?_packageCheckoutPaths(),
     Platform.script.resolve('native/quickjs/libquickjs_bridge.so').toFilePath(),
+    '${Directory.current.path}/native/quickjs/libquickjs_bridge.so',
   ];
   for (final candidate in candidates) {
     if (File(candidate).existsSync()) return candidate;
   }
-  // Fall through to the first candidate so the DynamicLibrary.open error
-  // carries a recognizable path.
   return candidates.first;
+}
+
+/// Paths to this package's own checkout(s) from `.dart_tool/package_config.json`,
+/// or `null` when no config is readable (e.g. compiled binaries).
+List<String>? _packageCheckoutPaths() {
+  final config = File(
+    '${Directory.current.path}/.dart_tool/package_config.json',
+  );
+  if (!config.existsSync()) return null;
+  final roots = <String>[];
+  try {
+    final packages =
+        (jsonDecode(config.readAsStringSync()) as Map)['packages'] as List;
+    for (final pkg in packages.cast<Map>()) {
+      if (pkg['name'] != 'quickjs_runtime') continue;
+      final root = Uri.parse(pkg['rootUri'] as String);
+      if (!root.isScheme('file')) continue;
+      roots.add(
+        '${Uri.decodeComponent(root.path)}native/quickjs/libquickjs_bridge.so',
+      );
+    }
+  } catch (_) {
+    return null;
+  }
+  return roots.isEmpty ? null : roots;
 }
 
 /// Low-level QuickJS FFI bindings.
