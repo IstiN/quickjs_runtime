@@ -61,9 +61,11 @@ List<String>? _packageCheckoutPaths() {
       if (pkg['name'] != 'quickjs_runtime') continue;
       final root = Uri.parse(pkg['rootUri'] as String);
       if (!root.isScheme('file')) continue;
-      roots.add(
-        '${Uri.decodeComponent(root.path)}native/quickjs/libquickjs_bridge.so',
-      );
+      // Hosted checkouts have no trailing slash in rootUri; git checkouts
+      // do. Normalize so the join always produces a valid path.
+      var rootPath = Uri.decodeComponent(root.path);
+      if (!rootPath.endsWith('/')) rootPath = '$rootPath/';
+      roots.add('${rootPath}native/quickjs/libquickjs_bridge.so');
     }
   } catch (_) {
     return null;

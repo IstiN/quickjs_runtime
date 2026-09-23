@@ -1,3 +1,13 @@
+# 0.3.2
+
+Fixes the native-library path join for **pub.dev (hosted) checkouts**:
+the package_config fallback built
+`<root>native/quickjs/libquickjs_bridge.so` without a separator when
+`rootUri` has no trailing slash (hosted) — workers died with
+`Failed to load dynamic library ...0.3.1native/...`. Also mirrors the
+stringified-env shim into the async prelude (`require('os')`). No API
+changes.
+
 # 0.3.1
 
 Restores the **sync `fetch`** and **timers / microtask auto-drain /
