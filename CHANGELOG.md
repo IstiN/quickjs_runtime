@@ -1,4 +1,15 @@
-# 0.3.2
+# 0.3.3
+
+- Conformance fixture v2: byte-identical cross-runtime script with
+  Buffer/URL/utilExtras/osProcess/events/fetchShapes/parallel sections
+  plus a timer-protocol family (`actionTimers` + `drainTimers`).
+- `util`: legacy Node predicates — `isArray`, `isString`, `isNumber`,
+  `isBoolean`, `isNull`, `isUndefined`, `isFunction`.
+- `util.inspect`: strings are now always single-quoted (Node semantics).
+- `util.format`: extra string args inserted raw; non-strings inspected
+  (previously everything was JSON.stringify-ed).
+
+## 0.3.2
 
 Fixes the native-library path join for **pub.dev (hosted) checkouts**:
 the package_config fallback built
