@@ -60,7 +60,7 @@ gates:
       # units; splitting the core prelude further would scatter shared
       # JS locals (cfg alias, unsupported(), inspectValue) across files.
       - paths: ['lib/src/node_compat.dart']
-        max_lines: 1100
+        max_lines: 1150
       # - max_lines: 2000
       #   paths: ['lib/legacy/**']
     # Glob patterns excluded from the gate.
@@ -138,6 +138,10 @@ gates:
         max_lines: 250
       - paths: ['test/node_compat_async_test.dart']
         max_lines: 600
+      # conformance v2 main(): fixture eval + worker-pool boot + both
+      # action families (sync surface + timer drain) + expected map.
+      - paths: ['test/cross_runtime_conformance_test.dart']
+        max_lines: 80
       - paths: ['test/node_compat_fetch_test.dart']
         max_lines: 300
   # Limit maximum block nesting level per method (catches complexity
