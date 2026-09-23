@@ -17,6 +17,22 @@ import 'package:test/test.dart';
 
 /// Evaluates [code] and decodes the JSON result (raw string when not
 /// JSON).
+/// The canned transport every runtime's harness installs for the
+/// fixture's `conformance://ping` fetch call (JSON string return, same
+/// contract as the production httpFetch hook).
+const String cannedFetchResponse =
+    '{"status":200,"headers":{"x":"y"},"body":"pong"}';
+
+String? cannedFetch(String requestJson) {
+  final url = jsonDecode(requestJson)['url'] as String?;
+  if (url == 'conformance://ping') return cannedFetchResponse;
+  return jsonEncode({
+    'status': 404,
+    'headers': <String, String>{},
+    'body': 'no conformance route',
+  });
+}
+
 Object? evalJson(QuickjsRuntime rt, String code) {
   final errors = <String?>[];
   final raw = rt.eval(code, errMsg: errors);
@@ -48,7 +64,11 @@ Future<void> compatWorkerMain(AsyncWorkerLink link) async {
       try {
         installNodeCompat(
           runtime,
-          NodeCompatConfig(utf8Encode: utf8.encode, utf8Decode: utf8.decode),
+          NodeCompatConfig(
+            utf8Encode: utf8.encode,
+            utf8Decode: utf8.decode,
+            httpFetch: cannedFetch,
+          ),
         );
         link.complete(
           AsyncJobEnvelope.fromJson(
@@ -90,13 +110,87 @@ const Map<String, dynamic> expected = {
   'uuidShape': true,
   'randomFilled': true,
   'cloneDeep': true,
+  'buffer': {
+    'typeofFn': true,
+    'isUint8Array': true,
+    'b64': 'aGVsbG8=',
+    'hexRoundTrip': true,
+    'latin1Hex': '68ff',
+    'utf8ByteLen': 12,
+    'le': 1,
+    'be': 9,
+    'slice': 'bc',
+    'copyRoundTrip': true,
+    'isBufferTrue': true,
+    'isBufferFalse':
+        true, // fixture value: `B.isBuffer(new Uint8Array(4)) === false`
+  },
+  'url': {
+    'href': 'https://example.com/a/b?q=1&x=%20#frag',
+    'origin': 'https://example.com',
+    'pathname': '/a/b',
+    'search': '?q=1&x=%20',
+    'hash': '#frag',
+    'q': '1',
+    'xDecoded': ' ',
+    'getAllA': '1|2',
+    'bDecoded': 'x y',
+    'appendForm': 'k=a+b',
+    'canParse': true,
+  },
+  'utilExtras': {
+    'inspectString': "'hi'",
+    'inspectNumber': '42',
+    'isArray': true,
+    'isString': true,
+    'hasTime': true,
+  },
+  'osProcess': {
+    'osEolType': 'string',
+    'osPlatformType': 'string',
+    'osArchType': 'string',
+    'osHomedirType': 'string',
+    'nextTickType': 'function',
+    'hrtimeType': 'function',
+    'argvIsArray': true,
+    'pidIsNumber': true,
+    'exitIsFunction': true,
+  },
+  'intl': {
+    'numberFormat': true,
+    'dateTimeFormat': true,
+    'canonicalLocales': true,
+  },
+  'events': {
+    'got': 't1,o',
+    'emitReturnNoListener': true,
+    'hasOff': true,
+    'listenerCount': 1,
+  },
+  'fetchShapes': {
+    'fetchTypeof': 'function',
+    'headerGet': 'b',
+    'headerHas': true,
+    'responseType': 'function',
+    'callStatus': 200,
+    'callHeader': 'y',
+    'callBody': true,
+  },
   'stubGuards': true,
   'parallel': {
     'sum': 5050,
     'workerBase': 'parallel.js',
     'workerUtf8': 4,
+    'workerBuffer': 'b2s=',
     'allValues': ['first', 'second'],
   },
+};
+
+/// The timers protocol result (step 3-5 of the header): one ready drain
+/// pass runs immediates before due timeouts; the microtask fired at the
+/// end of the actionTimers eval.
+const Map<String, dynamic> expectedTimers = {
+  'log': ['sync', 'p1', 'imm', 't0', 'iv'],
 };
 
 void main() {
@@ -107,7 +201,11 @@ void main() {
     try {
       installNodeCompat(
         rt,
-        NodeCompatConfig(utf8Encode: utf8.encode, utf8Decode: utf8.decode),
+        NodeCompatConfig(
+          utf8Encode: utf8.encode,
+          utf8Decode: utf8.decode,
+          httpFetch: cannedFetch,
+        ),
       );
       await pool.boot();
       pool.attachMainRuntime(rt);
@@ -124,6 +222,36 @@ void main() {
       expect(evalJson(rt, 'action(params)'), equals(expected));
     } finally {
       pool.dispose();
+      rt.close();
+    }
+  });
+
+  test('timers protocol: microtask at eval end, one drain pass ordering', () {
+    final rt = QuickjsRuntime();
+    final handle = installNodeCompat(
+      rt,
+      NodeCompatConfig(
+        utf8Encode: utf8.encode,
+        utf8Decode: utf8.decode,
+        httpFetch: cannedFetch,
+      ),
+    );
+    try {
+      final errors = <String?>[];
+      rt.eval(
+        File('test/fixtures/cross_runtime_conformance.js').readAsStringSync(),
+        filename: 'cross_runtime_conformance.js',
+        errMsg: errors,
+      );
+      if (errors.isNotEmpty) throw StateError(errors.first!);
+      expect(
+        evalJson(rt, 'actionTimers({})'),
+        'registered',
+      );
+      final stats = handle.drainTimers();
+      expect(stats.ran, 3); // imm + t0 + iv
+      expect(evalJson(rt, 'globalThis.__timersOut'), equals(expectedTimers));
+    } finally {
       rt.close();
     }
   });

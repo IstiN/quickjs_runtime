@@ -471,7 +471,7 @@ const String nodeCompatPrelude = r'''
         if (v === null) return 'null';
         if (v === undefined) return 'undefined';
         var t = typeof v;
-        if (t === 'string') return depth ? "'" + v + "'" : v;
+        if (t === 'string') return "'" + v.replace(/\\/g, '\\\\').replace(/'/g, "\\'") + "'";
         if (t === 'number' || t === 'boolean' || t === 'bigint') return String(v);
         if (t === 'function') return '[Function: ' + (v.name || 'anonymous') + ']';
         if (Array.isArray(v)) {
@@ -978,13 +978,23 @@ const String nodeCompatPrelude = r'''
             return safeStringify(v);
         });
         if (args.length) {
-            out += ' ' + args.map(function (v) { return safeStringify(v); }).join(' ');
+            // Node: extra string args are inserted raw; the rest via util.inspect.
+            out += ' ' + args.map(function (v) {
+                return typeof v === 'string' ? v : inspectValue(v, 0);
+            }).join(' ');
         }
         return out;
     }
     globalThis.util = {
         inspect: function (v) { return inspectValue(v, 0); },
         format: format,
+        isArray: Array.isArray,
+        isString: function (v) { return typeof v === 'string'; },
+        isNumber: function (v) { return typeof v === 'number'; },
+        isBoolean: function (v) { return typeof v === 'boolean'; },
+        isNull: function (v) { return v === null; },
+        isUndefined: function (v) { return v === undefined; },
+        isFunction: function (v) { return typeof v === 'function'; },
         types: {
             isPromise: function (v) { return v instanceof Promise; }
         },
