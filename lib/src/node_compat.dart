@@ -36,6 +36,7 @@ library;
 import 'dart:convert';
 
 import 'node_compat_buffer.dart';
+import 'node_compat_fetch.dart';
 import 'node_compat_url.dart';
 import 'quickjs_runtime.dart';
 
@@ -66,6 +67,7 @@ class NodeCompatConfig {
     this.tmpdir,
     this.homedir,
     this.cpusCount,
+    this.httpFetch,
   });
 
   /// `process.env` snapshot.
@@ -134,6 +136,14 @@ class NodeCompatConfig {
 
   /// `os.cpus().length`; defaults to `1`.
   final int Function()? cpusCount;
+
+  /// Synchronous `fetch` transport. Receives the JSON request
+  /// (`{method, url, headers, body?}`) and returns the JSON response
+  /// (`{status, statusText?, headers, body}`) — or throws / returns
+  /// `{error: message}` for a network failure (surfaced as
+  /// `TypeError: fetch failed` with `cause`, like Node). When set, the
+  /// real `fetch`/`Headers`/`Response` globals replace the tier-2 stub.
+  final String? Function(String requestJson)? httpFetch;
 }
 
 /// Returned by [installNodeCompat] so the embedding can adjust per-script
@@ -223,9 +233,17 @@ NodeCompatHandle installNodeCompat(
     cfg.exitHook?.call(jsonDecode(argsJson) as int);
     return null;
   });
+  if (cfg.httpFetch != null) {
+    host('__ncFetch', (argsJson) {
+      return cfg.httpFetch!(argsJson);
+    });
+  }
   runtime.eval(nodeCompatPrelude, filename: '<node_compat>');
   runtime.eval(nodeCompatBufferPrelude, filename: '<node_compat_buffer>');
   runtime.eval(nodeCompatUrlPrelude, filename: '<node_compat_url>');
+  if (cfg.httpFetch != null) {
+    runtime.eval(nodeCompatFetchPrelude, filename: '<node_compat_fetch>');
+  }
   return NodeCompatHandle._(runtime);
 }
 

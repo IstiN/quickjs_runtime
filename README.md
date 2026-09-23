@@ -119,6 +119,15 @@ instance `toString`/`write`/`fill`/`copy`/`equals`/`indexOf`/`slice`/
 special-scheme default ports, relative resolution, live `searchParams`
 binding, `origin`, `canParse`/`parse`, form-urlencoded codec.
 
+**`fetch`** becomes real when the embedding provides an HTTP transport
+(`NodeCompatConfig.httpFetch`): Node-shaped `fetch(input, init)` with
+`Headers` (case-insensitive) and `Response` (`ok`, `status`, `headers`,
+one-shot `text()`/`json()`/`arrayBuffer()`/`bytes()` with the
+`bodyUsed` guard). Body accessors return plain values — await-compatible,
+documented. Network failures throw `TypeError: fetch failed` with the
+transport message in `error.cause`; `init.signal` is accepted and
+ignored. Without the hook the self-documenting stub stays.
+
 **console** gains `time`/`timeEnd`/`timeLog`, `count`/`countReset`,
 `group`/`groupEnd`, `table`, `dir`, `trace`; `util.inspect` renders
 Node-style. **process** gains `argv`, `pid`, `execPath`, `hrtime`
