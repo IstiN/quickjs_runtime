@@ -224,7 +224,8 @@ void main() {
     tearDown(() => rt.close());
 
     test('stubs are typeof-safe but throw the alternative on call', () {
-      // Buffer graduated from tier-2 stub to a real Uint8Array subclass
+      // Buffer graduated from tier-2 stub to a real Uint8Array subclass;
+      // timers graduated from tier-2 stubs to a real sync-drain scheduler
       expect(evalJson(rt, 'typeof Buffer.from'), 'function');
       expect(evalJson(rt, 'typeof fetch'), 'function');
       expect(evalJson(rt, 'typeof setTimeout'), 'function');
@@ -233,10 +234,6 @@ void main() {
         'fetch(1)',
         "fetch('http://x')",
         'new AbortController()',
-        'setTimeout(function () {}, 10)',
-        'setInterval(function () {}, 10)',
-        'setImmediate(function () {})',
-        'process.nextTick(function () {})',
       ]) {
         final errors = <String?>[];
         rt.eval(expr, errMsg: errors);
@@ -245,7 +242,22 @@ void main() {
       }
     });
 
-    test('clearTimeout / clearInterval are no-ops', () {
+    test('timer callbacks must be functions', () {
+      for (final expr in [
+        'setTimeout(1, 10)',
+        'setInterval(1, 10)',
+        'setImmediate(1)',
+        'queueMicrotask(1)',
+        'process.nextTick(1)',
+      ]) {
+        final errors = <String?>[];
+        rt.eval(expr, errMsg: errors);
+        expect(errors.first, isNotNull, reason: expr);
+        expect(errors.first!, contains('must be a function'), reason: expr);
+      }
+    });
+
+    test('clearTimeout / clearInterval are no-ops on junk', () {
       expect(evalJson(rt, 'clearTimeout(1); clearInterval(2); "ok"'), 'ok');
     });
   });

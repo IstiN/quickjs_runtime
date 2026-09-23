@@ -124,7 +124,7 @@ gates:
       # Grouping knobs into sub-objects would diverge the public API
       # from the documented Node-parity surface.
       - paths: ['lib/src/node_compat.dart']
-        max_params: 24
+        max_params: 28
       # The compat test suites are scenario tables: each main() composes
       # the group suites for one surface (Buffer/URL parity, timers,
       # events). Splitting them would push shared fixture closures
@@ -136,6 +136,10 @@ gates:
         max_lines: 300
       - paths: ['test/async_engine_pool_test.dart']
         max_lines: 250
+      - paths: ['test/node_compat_async_test.dart']
+        max_lines: 600
+      - paths: ['test/node_compat_fetch_test.dart']
+        max_lines: 300
   # Limit maximum block nesting level per method (catches complexity
   # gate dodging via deeply nested early-return chains).
   nesting:

@@ -109,8 +109,9 @@ structuredClone(v);                    // JSON fidelity
 Buffer.from('hi', 'utf8').toString('base64'); // 'aGk='
 new URL('?b=2', 'http://h/a?x=1').href;       // 'http://h/a?b=2'
 console.time('x'); console.timeEnd('x');      // 'x: 0.123ms'
-setTimeout(f, 10);                     // throws: no event loop — use
-                                       // runAsync or run the work directly
+var EventEmitter = require('events');
+setTimeout(f, 10);                     // registers; fires when the host
+                                       // drains timers (see below)
 ```
 
 **Buffer** is a real `Uint8Array` subclass with the Node encodings
@@ -123,6 +124,15 @@ instance `toString`/`write`/`fill`/`copy`/`equals`/`indexOf`/`slice`/
 special-scheme default ports, relative resolution, live `searchParams`
 binding, `origin`, `canParse`/`parse`, form-urlencoded codec.
 
+**`fetch`** becomes real when the embedding provides an HTTP transport
+(`NodeCompatConfig.httpFetch`): Node-shaped `fetch(input, init)` with
+`Headers` (case-insensitive) and `Response` (`ok`, `status`, `headers`,
+one-shot `text()`/`json()`/`arrayBuffer()`/`bytes()` with the
+`bodyUsed` guard). Body accessors return plain values — await-compatible,
+documented. Network failures throw `TypeError: fetch failed` with the
+transport message in `error.cause`; `init.signal` is accepted and
+ignored. Without the hook the self-documenting stub stays.
+
 **console** gains `time`/`timeEnd`/`timeLog`, `count`/`countReset`,
 `group`/`groupEnd`, `table`, `dir`, `trace`; `util.inspect` renders
 Node-style. **process** gains `argv`, `pid`, `execPath`, `hrtime`
@@ -133,9 +143,57 @@ Node-style. **process** gains `argv`, `pid`, `execPath`, `hrtime`
 QuickJS). Default text codecs are real UTF-8; hooks remain for override.
 
 Builtin modules via `require`: `path`, `assert`, `util`, `os`, `url`,
-`buffer`. Consumers can register more
+`buffer`, `events`. Consumers can register more
 (`installNodeCompatModule(rt, 'fs', factory)`) and a pre-existing
 `require` loader stays reachable as the fallback.
+
+### Timers, microtasks and `events` (host-driven, no event loop)
+
+Promise reactions drain automatically after every `QuickjsRuntime.eval`
+(Node/GraalJS parity — `.then` chains, `queueMicrotask`,
+`util.promisify` just work; the drain is capped so a self-re-enqueueing
+chain cannot hang the host, and `QuickjsRuntime(autoDrainMicrotasks:
+false)` restores manual draining via `drainMicrotasks()`).
+
+Timers (`setTimeout`/`setInterval`/`setImmediate` + `clear*`) are real
+but **host-driven** — there is no background loop to fire them. The
+embedding drains at its chosen checkpoints:
+
+```dart
+final compat = installNodeCompat(rt, NodeCompatConfig(
+  timerDrain: TimerDrainMode.block, // ready (default) | none
+  sleep: (d) => myBlockingSleep(d), // default: C-bridge qjs_sleep_ms
+));
+rt.eval('setTimeout(function () { step(2); }, 50);');
+final stats = compat.drainTimers(); // runs due timers + microtasks
+```
+
+- `TimerDrainMode.ready` (default): one pass — what is due now runs,
+  future timers stay queued. Safe on UI isolates.
+- `TimerDrainMode.block`: loops, blocking the thread (via `sleep`)
+  until the earliest ref'd timer is due, the queue empties, or a guard
+  raises (`maxTimerCallbacks` per pass — the `setInterval(fn, 0)` storm
+  guard; `maxTimerDrainWallClock`). Unref'd timers never hold the
+  drain. For CLI embeddings where "setTimeout as sleep" must behave
+  like Node.
+- Ordering matches Node for the common cases: sync code always runs
+  before any timer, immediates run before due timeouts, equal dues in
+  registration order. Timer callbacks never interrupt a running script
+  — they run between drain passes.
+
+**`events`** is 1:1: Node's `EventEmitter` is synchronous, so
+`require('events')` needs no loop at all (`on`/`once`/`prepend*`/
+`off`/`removeAllListeners`/`emit`/`listenerCount`/`eventNames`/
+`setMaxListeners`, `error` with no listener throws, max-listeners
+warning via `console.warn`).
+
+**Known deviations vs Node** (all documented, all deterministic):
+timer callbacks run only between host checkpoints — a `setInterval`
+tick never interrupts script code; `process.nextTick` maps onto the
+microtask queue (interleaves in promise order instead of running
+before promise reactions); body accessors and timer handles expose
+plain values/no-op `ref` for immediates; no `AbortSignal`, no streams,
+no workers — those need real concurrency (`runAsync` covers engines).
 
 
 ## Testing

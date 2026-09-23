@@ -420,8 +420,7 @@ void main() {
     test('util.inspect is deep and readable (Node style)', () {
       expect(js("util.inspect({a: [1, 'x'], b: {c: null}})"),
           "{ a: [ 1, 'x' ], b: { c: null } }");
-      expect(js("util.inspect(function named() {})"),
-          '[Function: named]');
+      expect(js("util.inspect(function named() {})"), '[Function: named]');
     });
   });
 

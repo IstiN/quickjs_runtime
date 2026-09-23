@@ -13,10 +13,19 @@
 /// tools).
 ///
 /// **Tier 2 — known-unsupported, self-documenting stubs:** touching
-/// `Buffer`, `fetch`, `AbortController`, `setTimeout`, `setInterval`,
-/// `setImmediate`, or `process.nextTick` throws a message naming the
-/// alternative — an intentional error beats a bare `ReferenceError` for
-/// script authors (human or AI).
+/// `fetch` (without a [NodeCompatConfig.httpFetch] transport) or
+/// `AbortController` throws a message naming the alternative — an
+/// intentional error beats a bare `ReferenceError` for script authors
+/// (human or AI).
+///
+/// **Timers are real** but host-driven, because there is no background
+/// event loop: `setTimeout`/`setInterval`/`setImmediate`/`queueMicrotask`
+/// register work and [NodeCompatHandle.drainTimers] runs it at the
+/// embedding's chosen checkpoints (three modes, default one ready-pass per
+/// call). Promise reactions drain automatically after every
+/// `QuickjsRuntime.eval`. The `events` module is 1:1 — Node's
+/// EventEmitter is synchronous. See the README for the exact deviation
+/// list vs Node.
 ///
 /// Everything is opt-in: an unmodified `QuickjsRuntime` keeps its
 /// clean-room ES2020 surface until [installNodeCompat] runs.
@@ -35,9 +44,13 @@ library;
 
 import 'dart:convert';
 
+import 'node_compat_async.dart';
 import 'node_compat_buffer.dart';
+import 'node_compat_fetch.dart';
 import 'node_compat_url.dart';
 import 'quickjs_runtime.dart';
+
+part 'node_compat_fallbacks.dart';
 
 /// Consumer hooks and values for [installNodeCompat].
 class NodeCompatConfig {
@@ -66,6 +79,11 @@ class NodeCompatConfig {
     this.tmpdir,
     this.homedir,
     this.cpusCount,
+    this.httpFetch,
+    this.timerDrain = TimerDrainMode.ready,
+    this.maxTimerCallbacks = 1000,
+    this.maxTimerDrainWallClock = const Duration(seconds: 30),
+    this.sleep,
   });
 
   /// `process.env` snapshot.
@@ -134,14 +152,67 @@ class NodeCompatConfig {
 
   /// `os.cpus().length`; defaults to `1`.
   final int Function()? cpusCount;
+
+  /// Synchronous `fetch` transport. Receives the JSON request
+  /// (`{method, url, headers, body?}`) and returns the JSON response
+  /// (`{status, statusText?, headers, body}`) — or throws / returns
+  /// `{error: message}` for a network failure (surfaced as
+  /// `TypeError: fetch failed` with `cause`, like Node). When set, the
+  /// real `fetch`/`Headers`/`Response` globals replace the tier-2 stub.
+  final String? Function(String requestJson)? httpFetch;
+
+  /// How [NodeCompatHandle.drainTimers] runs due timers and immediates.
+  ///
+  /// - [TimerDrainMode.none]: timers are inert (calling them still registers
+  ///   them, but nothing ever fires) — for embeddings that drive draining
+  ///   themselves through raw evals.
+  /// - [TimerDrainMode.ready] (default): one pass — what is due *now* runs,
+  ///   future timers are left queued. Safe everywhere, including UI isolates.
+  /// - [TimerDrainMode.block]: loops, blocking the thread (via [sleep]) until
+  ///   the earliest ref'd timer is due, the queue empties, [maxTimerCallbacks]
+  ///   or [maxTimerDrainWallClock] is hit. For CLI embeddings (dmtools) where
+  ///   "setTimeout as sleep" must behave like Node.
+  ///
+  /// Scripts are the only activity in this runtime (I/O is synchronous), so a
+  /// blocking drain is semantically faithful: there is nothing to multiplex
+  /// except timers. Timer callbacks run between script statements, never
+  /// inside one — see the README for the exact deviation list vs Node.
+  final TimerDrainMode timerDrain;
+
+  /// Maximum timer/immediate callbacks a single [NodeCompatHandle.drainTimers]
+  /// pass may run before raising — the `setInterval(fn, 0)` storm guard.
+  final int maxTimerCallbacks;
+
+  /// Wall-clock bound for a blocking drain ([TimerDrainMode.block]).
+  final Duration maxTimerDrainWallClock;
+
+  /// Blocking sleep for [TimerDrainMode.block]. Defaults to the C bridge's
+  /// `qjs_sleep_ms` (a no-op when the loaded library predates it, which makes
+  /// a blocking drain degrade to ready-only).
+  final void Function(Duration duration)? sleep;
+}
+
+/// Timer draining strategy — see [NodeCompatConfig.timerDrain].
+enum TimerDrainMode { none, ready, block }
+
+/// Stats from a [NodeCompatHandle.drainTimers] run.
+class TimerDrainStats {
+  const TimerDrainStats({required this.ran, required this.pending});
+
+  /// Timer + immediate callbacks executed.
+  final int ran;
+
+  /// Timers still queued (intervals and not-yet-due timeouts).
+  final int pending;
 }
 
 /// Returned by [installNodeCompat] so the embedding can adjust per-script
 /// state after install (and tear the surface down with [dispose]).
 class NodeCompatHandle {
-  NodeCompatHandle._(this._runtime);
+  NodeCompatHandle._(this._runtime, this._cfg);
 
   final QuickjsRuntime _runtime;
+  final NodeCompatConfig _cfg;
 
   /// Updates `__filename` / `__dirname` and `process.argv[1]` to [path].
   void setScriptPath(String path) {
@@ -149,6 +220,113 @@ class NodeCompatHandle {
       'globalThis.__ncSetScriptPath(${jsonEncode(path)});',
       filename: '<node_compat_script_path>',
     );
+  }
+
+  double _nowMs() =>
+      _cfg.clock?.call() ?? DateTime.now().millisecondsSinceEpoch.toDouble();
+
+  void _sleep(Duration duration) {
+    final hook = _cfg.sleep;
+    if (hook != null) {
+      hook(duration);
+      return;
+    }
+    _runtime.sleepMs(duration.inMilliseconds);
+  }
+
+  /// Drains due timers and immediates, per [NodeCompatConfig.timerDrain].
+  ///
+  /// - `ready` (default): runs what is due now (plus microtasks), leaves
+  ///   future timers queued. Safe on UI isolates.
+  /// - `block`: additionally sleeps until the earliest ref'd timer is due
+  ///   and keeps draining until the queue empties, [maxTimerDrainWallClock]
+  ///   elapses (raises), or [maxTimerCallbacks] is exceeded per pass
+  ///   (raises — the `setInterval(fn, 0)` storm guard). Unref'd timers do
+  ///   not hold the drain.
+  ///
+  /// Timer callbacks run between passes, never re-entrantly inside a
+  /// callback: this calls into JS as a fresh top-level eval.
+  TimerDrainStats drainTimers({Duration? deadline}) {
+    if (_cfg.timerDrain == TimerDrainMode.none) {
+      return const TimerDrainStats(ran: 0, pending: 0);
+    }
+    final wall = Stopwatch()..start();
+    final limit = deadline ?? _cfg.maxTimerDrainWallClock;
+    var ran = 0;
+    while (true) {
+      final st = _drainPass();
+      ran += (st['ran'] as num).toInt();
+      // promise reactions queued by callbacks run before the next pass
+      _runtime.drainMicrotasks();
+
+      final nextDue = st['nextDue'];
+      if (_cfg.timerDrain != TimerDrainMode.block || nextDue == null) {
+        return _finishPass(ran);
+      }
+      if (_waitForNextDue(nextDue, wall, limit)) continue;
+    }
+  }
+
+  static const _timerDrainFile = '<node_compat_timer_drain>';
+
+  /// Runs one drain pass; raises on eval failure or the storm guard.
+  Map<String, dynamic> _drainPass() {
+    final errMsg = <String?>[null];
+    // jsonDecode (not JS stringify — that would double-encode).
+    final raw = _runtime.eval(
+      'globalThis.__ncTimerDrain()',
+      filename: _timerDrainFile,
+      errMsg: errMsg,
+    );
+    if (raw == null) {
+      throw StateError(
+          'node_compat timer drain failed: ${errMsg[0] ?? "unknown"}');
+    }
+    final st = jsonDecode(raw) as Map<String, dynamic>;
+    if (st['capped'] == true) {
+      throw StateError('node_compat timer drain exceeded maxTimerCallbacks '
+          '(${_cfg.maxTimerCallbacks}) — possible setInterval(fn, 0) storm');
+    }
+    return st;
+  }
+
+  /// Pending-timer count after a pass, as the drain result.
+  TimerDrainStats _finishPass(int ran) {
+    final pending = _runtime.eval(
+      'globalThis.__ncTimerPendingCount()',
+      filename: _timerDrainFile,
+    );
+    return TimerDrainStats(
+      ran: ran,
+      pending: pending == null ? 0 : int.parse(pending),
+    );
+  }
+
+  /// Returns `true` when the earliest timer is already due (drain again
+  /// now); otherwise sleeps for clamp(wait, remaining wall clock) —
+  /// raising when the wall-clock budget is exhausted with timers left.
+  bool _waitForNextDue(Object? nextDue, Stopwatch wall, Duration limit) {
+    final waitMs = (nextDue as num).toDouble() - _nowMs();
+    if (waitMs <= 0) return true;
+    if (wall.elapsed >= limit) {
+      final pending = _runtime.eval(
+        'globalThis.__ncTimerPendingCount()',
+        filename: _timerDrainFile,
+      );
+      throw StateError(
+          'node_compat timer drain exceeded maxTimerDrainWallClock '
+          '($limit) with $pending timers still pending — '
+          'an interval that never ends?');
+    }
+    final remaining = limit - wall.elapsed;
+    var sleepFor = waitMs;
+    if (Duration(milliseconds: sleepFor.round()) > remaining) {
+      sleepFor = remaining.inMilliseconds.toDouble();
+    }
+    if (sleepFor > 0) {
+      _sleep(Duration(milliseconds: sleepFor.round()));
+    }
+    return false;
   }
 }
 
@@ -206,6 +384,11 @@ void _registerCompatHosts(
     cfg.exitHook?.call(jsonDecode(argsJson) as int);
     return null;
   });
+  if (cfg.httpFetch != null) {
+    host('__ncFetch', (argsJson) {
+      return cfg.httpFetch!(argsJson);
+    });
+  }
 }
 
 /// Installs the compat layer onto [runtime]. Idempotent per runtime
@@ -235,10 +418,16 @@ NodeCompatHandle installNodeCompat(
     'homedir': cfg.homedir?.call(),
   });
   _registerCompatHosts(runtime, cfg, host);
+
+  runtime.setGlobal('__ncMaxTimerCallbacks', cfg.maxTimerCallbacks);
   runtime.eval(nodeCompatPrelude, filename: '<node_compat>');
+  runtime.eval(nodeCompatAsyncPrelude, filename: '<node_compat_async>');
   runtime.eval(nodeCompatBufferPrelude, filename: '<node_compat_buffer>');
   runtime.eval(nodeCompatUrlPrelude, filename: '<node_compat_url>');
-  return NodeCompatHandle._(runtime);
+  if (cfg.httpFetch != null) {
+    runtime.eval(nodeCompatFetchPrelude, filename: '<node_compat_fetch>');
+  }
+  return NodeCompatHandle._(runtime, cfg);
 }
 
 /// Registers (or replaces) one consumer-provided builtin module visible
@@ -263,86 +452,6 @@ void installNodeCompatModule(
 }
 
 String _safeName(String name) => name.replaceAll(RegExp(r'[^A-Za-z0-9_]'), '_');
-
-// ── Default (non-secure / approximating) fallbacks ──
-
-/// Base64 arithmetic 4-bit mask (also reused by the UUID nibble layout).
-const int _b64QuadMask = 0x0F;
-
-/// RFC 4122 UUIDv4 bit layout: version nibble + variant bits.
-const int _uuidNibbleMask = _b64QuadMask;
-const int _uuidVersion4 = 0x40;
-const int _uuidVariantMask = 0x3F;
-const int _uuidVariantBits = 0x80;
-
-/// LCG state seed and modulus for the non-secure fallback PRNG.
-const int _pseudoSeed = 0x2545F491;
-const int _pseudoMask = 0x7FFFFFFF;
-
-int _pseudoState = _pseudoSeed;
-
-List<int> _pseudoRandom(int count) => List<int>.generate(
-      count,
-      (_) =>
-          (_pseudoState = (_pseudoState * 1103515245 + 12345) & _pseudoMask) &
-          0xFF,
-      growable: false,
-    );
-
-String _pseudoUuid() {
-  final bytes = _pseudoRandom(16);
-  bytes[6] = (bytes[6] & _uuidNibbleMask) | _uuidVersion4;
-  bytes[8] = (bytes[8] & _uuidVariantMask) | _uuidVariantBits;
-  String hex(int b) => b.toRadixString(16).padLeft(2, '0');
-  final s = bytes.map(hex).join();
-  return '${s.substring(0, 8)}-${s.substring(8, 12)}-'
-      '${s.substring(12, 16)}-${s.substring(16, 20)}-${s.substring(20)}';
-}
-
-// True UTF-8 (dart:convert) — the latin-1 approximation is gone: default
-// codecs must match Node byte-for-byte, hooks are for override only.
-List<int> _utf8Bytes(String text) => utf8.encode(text);
-
-String _utf8String(List<int> bytes) => utf8.decode(bytes, allowMalformed: true);
-
-// Minimal base64 (RFC 4648) for the no-hook default path.
-const String _b64alphabet =
-    'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-
-String _b64Encode(String text) {
-  final bytes = _utf8Bytes(text);
-  final out = StringBuffer();
-  for (var i = 0; i < bytes.length; i += 3) {
-    final b0 = bytes[i];
-    final b1 = i + 1 < bytes.length ? bytes[i + 1] : null;
-    final b2 = i + 2 < bytes.length ? bytes[i + 2] : null;
-    out.write(_b64alphabet[b0 >> 2]);
-    out.write(_b64alphabet[((b0 & 0x03) << 4) | ((b1 ?? 0) >> 4)]);
-    out.write(
-      b1 == null
-          ? '='
-          : _b64alphabet[((b1 & _b64QuadMask) << 2) | ((b2 ?? 0) >> 6)],
-    );
-    out.write(b2 == null ? '=' : _b64alphabet[b2 & 0x3F]);
-  }
-  return out.toString();
-}
-
-String _b64Decode(String text) {
-  final clean = text.replaceAll('=', '').replaceAll(RegExp(r'\s'), '');
-  final out = <int>[];
-  for (var i = 0; i < clean.length; i += 4) {
-    final n = [0, 1, 2, 3]
-        .map((k) =>
-            i + k < clean.length ? _b64alphabet.indexOf(clean[i + k]) : 0)
-        .toList();
-    out.add((n[0] << 2) | (n[1] >> 4));
-    if (i + 2 < clean.length)
-      out.add(((n[1] & _b64QuadMask) << 4) | (n[2] >> 2));
-    if (i + 3 < clean.length) out.add(((n[2] & 0x03) << 6) | n[3]);
-  }
-  return _utf8String(out);
-}
 
 /// The compat surface, as one JS bootstrap evaluated by
 /// [installNodeCompat].
@@ -385,6 +494,7 @@ const String nodeCompatPrelude = r'''
         return String(v);
     }
 
+    globalThis.__ncUnsupported = unsupported;
     function unsupported(name, alternative) {
         var fn = function () {
             throw new Error(name + ' is not available in quickjs_runtime: ' +
@@ -617,8 +727,15 @@ const String nodeCompatPrelude = r'''
             }
             throw new Error('ProcessExit: ' + (code || 0));
         },
-        nextTick: unsupported('process.nextTick',
-            'no scheduling beyond promises — run the work directly')
+        // Deviation vs Node: mapped onto the microtask queue, so
+        // nextTick callbacks interleave in promise order instead of
+        // running before all promise reactions.
+        nextTick: function (fn) {
+            if (typeof fn !== 'function') {
+                throw new TypeError('process.nextTick callback must be a function');
+            }
+            Promise.resolve().then(fn);
+        }
     };
     process.hrtime.bigint = function () {
         var ms = monoMs();
@@ -870,6 +987,58 @@ const String nodeCompatPrelude = r'''
         format: format,
         types: {
             isPromise: function (v) { return v instanceof Promise; }
+        },
+        // Node-shaped promisify: last-argument (err, value) callback →
+        // Promise. Real since the microtask queue is drained by the host.
+        promisify: function (fn) {
+            if (typeof fn !== 'function') {
+                throw new TypeError(
+                    'util.promisify argument must be a function');
+            }
+            if (fn.__ncPromisified) return fn;
+            var wrapped = function () {
+                var self = this;
+                var args = Array.prototype.slice.call(arguments);
+                return new Promise(function (resolve, reject) {
+                    args.push(function (err, value) {
+                        if (err) reject(err); else resolve(value);
+                    });
+                    try {
+                        fn.apply(self, args);
+                    } catch (e) {
+                        reject(e);
+                    }
+                });
+            };
+            wrapped.__ncPromisified = true;
+            return wrapped;
+        },
+        // Node-shaped callbackify: Promise-returning function →
+        // (err, value) callback style; rejections surface as the err
+        // argument.
+        callbackify: function (fn) {
+            if (typeof fn !== 'function') {
+                throw new TypeError(
+                    'util.callbackify argument must be a function');
+            }
+            return function () {
+                var self = this;
+                var args = Array.prototype.slice.call(arguments);
+                var cb = args.pop();
+                if (typeof cb !== 'function') {
+                    throw new TypeError(
+                        'util.callbackify last argument must be a function');
+                }
+                try {
+                    fn.apply(self, args).then(
+                        function (value) { cb(null, value); },
+                        function (err) {
+                            cb(err || new Error('falsy rejection'));
+                        });
+                } catch (e) {
+                    cb(e);
+                }
+            };
         }
     };
 
@@ -880,10 +1049,11 @@ const String nodeCompatPrelude = r'''
         path: function () { return path; },
         assert: function () { return assert; },
         util: function () { return globalThis.util; },
-        os: function () { return osModule; },
         url: function () { return globalThis.__ncRegistry.url(); },
         buffer: function () { return globalThis.__ncRegistry.buffer(); }
     };
+    // The async prelude (events/os/timers) augments this same map after eval.
+    globalThis.__ncBuiltins = builtins;
     var baseRequire = typeof require === 'function' ? require : null;
     function compatRequire(name) {
         if (Object.prototype.hasOwnProperty.call(registry, name)) {
@@ -894,7 +1064,7 @@ const String nodeCompatPrelude = r'''
         }
         if (baseRequire) return baseRequire(name);
         throw new Error("Cannot find module '" + name +
-            "' (compat builtins: path, assert, util, os, url, buffer" +
+            "' (compat builtins: path, assert, util, os, url, buffer, events" +
             (Object.keys(registry).length
                 ? '; consumer-registered: ' + Object.keys(registry).join(', ')
                 : '') + ')');
@@ -926,64 +1096,5 @@ const String nodeCompatPrelude = r'''
         }
     };
 
-    // ── os builtin module (require('os'); no global, like Node) ──
-    var osModule = {
-        EOL: cfg.platform === 'win32' ? '\r\n' : '\n',
-        arch: function () { return cfg.arch; },
-        platform: function () { return cfg.platform; },
-        type: function () {
-            if (cfg.platform === 'win32') return 'Windows_NT';
-            if (cfg.platform === 'darwin') return 'Darwin';
-            return 'Linux';
-        },
-        release: function () { return ''; },
-        hostname: function () { return cfg.hostname || 'localhost'; },
-        tmpdir: function () {
-            if (cfg.tmpdir) return cfg.tmpdir;
-            if (cfg.platform === 'win32') {
-                return envObj.TEMP || envObj.TMP || 'C:\\Windows\\Temp';
-            }
-            return '/tmp';
-        },
-        homedir: function () {
-            if (cfg.homedir) return cfg.homedir;
-            return envObj.HOME || (cfg.platform === 'win32'
-                ? 'C:\\Users\\user' : '/root');
-        },
-        cpus: function () {
-            var n = cfg.cpusCount || 1;
-            var out = [];
-            for (var i = 0; i < n; i++) {
-                out.push({ model: 'QuickJS', speed: 0, times: {
-                    user: 0, nice: 0, sys: 0, idle: 0, irq: 0 } });
-            }
-            return out;
-        },
-        uptime: function () { return Math.floor(monoMs() / 1000); },
-        loadavg: function () { return [0, 0, 0]; },
-        totalmem: function () { return 0; },
-        freemem: function () { return 0; },
-        networkInterfaces: function () { return {}; },
-        userInfo: function () {
-            return { username: 'user', uid: -1, gid: -1, shell: null,
-                homedir: osModule.homedir() };
-        }
-    };
-
-    // ── Tier 2: call-time stubs (typeof-safe) ──
-    globalThis.fetch = unsupported('fetch',
-        'this runtime is sync-call-style — use the host-provided sync tools ' +
-        'or runAsync(fn, args) for parallel engines');
-    globalThis.AbortController = unsupported('AbortController',
-        'no async operations in this runtime — nothing to abort');
-    globalThis.setTimeout = unsupported('setTimeout',
-        'no event loop in v1 — run the work directly, or use runAsync ' +
-        'for parallel engines');
-    globalThis.clearTimeout = function () {};
-    globalThis.setInterval = unsupported('setInterval',
-        'no event loop in v1 — run the work directly');
-    globalThis.clearInterval = function () {};
-    globalThis.setImmediate = unsupported('setImmediate',
-        'no event loop in v1 — run the work directly');
 })();
 ''';

@@ -105,6 +105,9 @@ class QuickjsFfi {
     Pointer<Utf8> json,
   ) _setGlobalJson;
   late final int Function(Pointer<Void> context) _executePendingJobs;
+  late final int Function(Pointer<Void> context, int maxJobs)
+      _executePendingJobsCapped;
+  late final int Function(int ms) _sleepMs;
 
   /// Loads the shared library and resolves symbols.
   QuickjsFfi() {
@@ -169,6 +172,26 @@ class QuickjsFfi {
           .asFunction();
     } else {
       _executePendingJobs = (_) => 0;
+    }
+
+    // Additive, newer-build symbols (see the doc comments on the public
+    // wrappers). Degrade to equivalents that keep older .so binaries working:
+    // uncapped pending-job drain and a no-op sleep.
+    if (_lib.providesSymbol('qjs_execute_pending_jobs_capped')) {
+      _executePendingJobsCapped = _lib
+          .lookup<NativeFunction<Int32 Function(Pointer<Void>, Int32)>>(
+            'qjs_execute_pending_jobs_capped',
+          )
+          .asFunction();
+    } else {
+      _executePendingJobsCapped = (context, _) => _executePendingJobs(context);
+    }
+    if (_lib.providesSymbol('qjs_sleep_ms')) {
+      _sleepMs = _lib
+          .lookup<NativeFunction<Int32 Function(Int32)>>('qjs_sleep_ms')
+          .asFunction();
+    } else {
+      _sleepMs = (_) => -1;
     }
   }
 
@@ -263,4 +286,18 @@ class QuickjsFfi {
   /// Returns the number of executed jobs, or `-1` when a job threw. A no-op
   /// when the loaded library predates `qjs_execute_pending_jobs`.
   int executePendingJobs(Pointer<Void> context) => _executePendingJobs(context);
+
+  /// Like [executePendingJobs], but stops after [maxJobs] executed jobs so a
+  /// self-re-enqueueing microtask chain (`function f(){ Promise.resolve()
+  /// .then(f); } f();`) cannot hang the host thread. Falls back to the
+  /// uncapped drain when the loaded library predates the capped symbol.
+  int executePendingJobsCapped(Pointer<Void> context, int maxJobs) =>
+      _executePendingJobsCapped(context, maxJobs);
+
+  /// Blocks the calling thread for [ms] milliseconds.
+  ///
+  /// Returns `false` when the loaded library predates `qjs_sleep_ms`
+  /// (the timer pump then cannot wait and the caller must degrade to
+  /// ready-only draining).
+  bool sleepMs(int ms) => _sleepMs(ms) == 0;
 }

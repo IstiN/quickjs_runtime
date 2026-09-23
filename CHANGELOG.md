@@ -1,3 +1,15 @@
+# 0.3.1
+
+Restores the **sync `fetch`** and **timers / microtask auto-drain /
+`require('events')`** features: their stacked PRs (#7, #8) were merged
+out-of-band and their commits were not part of the `main` tree the
+0.3.0 tarball was published from — the 0.3.0 section below documents
+the intended surface, but only 0.3.1 actually ships it. Internally the
+async surface now lives in its own prelude
+(`node_compat_async.dart`); `require('events')`/`require('os')`
+registration moved from the core builtin map into that prelude. No
+other API or behavior changes.
+
 # 0.3.0
 
 - **Sync `fetch`** (opt-in): `NodeCompatConfig.httpFetch` hook + real
