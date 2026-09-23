@@ -1,5 +1,21 @@
-# Unreleased
+# 0.3.0
 
+- **Sync `fetch`** (opt-in): `NodeCompatConfig.httpFetch` hook + real
+  `Headers`/`Response` (`text()`/`json()`/`arrayBuffer()`, `bodyUsed`,
+  `ok`/`status`/`headers`); failures surface as
+  `TypeError: fetch failed` with `cause`. Bodies are plain values, so
+  `await res.text()` works through them; `AbortSignal` is not
+  supported (documented deviation). Without the hook, `fetch` stays a
+  self-documenting stub — the runtime remains I/O-clean.
+- **Real timers + microtask auto-drain + events**: promise reactions,
+  `queueMicrotask` and `process.nextTick` now actually run — the
+  QuickJS pending-job queue is drained (capped) after every successful
+  eval. `setTimeout`/`setInterval`/`setImmediate` + `clear*` are real,
+  host-driven callbacks via `NodeCompatHandle.drainTimers()` in
+  `ready` (default, UI-safe) / `block` (sleeps until the nearest
+  reffed timer — CLI "setTimeout as sleep") / `none` modes, with
+  `unref()`, a callback-count guard and a wall-clock budget.
+  `require('events')` provides the full synchronous `EventEmitter`.
 - **Node parity pack** (issue #3 follow-up): real `Buffer` (Uint8Array
   subclass, Node encodings + LE/BE accessors), `URL`/`URLSearchParams`
   (WHATWG subset verified against real Node), `console.time`/`table`/
@@ -20,9 +36,9 @@
     `crypto.randomUUID()`/`getRandomValues()`, `structuredClone`
     (JSON fidelity), `require()` builtin registry + consumer modules
     (`installNodeCompatModule`) + fallback to a pre-existing loader.
-  - **Tier 2 — self-documenting stubs:** `Buffer`, `fetch`,
-    `AbortController`, `setTimeout`/`setInterval`/`setImmediate`,
-    `process.nextTick` — `typeof`-safe, throw the alternative on call.
+  - **Tier 2 — self-documenting stub:** `AbortController` —
+    `typeof`-safe, throws the alternative on call (fetch has no signal
+    support yet).
   - Host hooks: env, cwd, clock, secure random, utf-8/base64 codecs,
     console sink, exit notification. Without hooks, safe defaults.
 
