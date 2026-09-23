@@ -15,4 +15,5 @@
 library;
 
 export 'src/quickjs_ffi.dart';
+export 'src/async_engine_pool.dart';
 export 'src/quickjs_runtime.dart';
