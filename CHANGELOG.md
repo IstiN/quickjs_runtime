@@ -1,5 +1,9 @@
 # Unreleased
 
+- **Sync `fetch`** behind `NodeCompatConfig.httpFetch` (embedding
+  provides the transport): real `fetch`/`Headers`/`Response` —
+  case-insensitive headers, one-shot body accessors, `TypeError:
+  fetch failed` + `cause`, await-compatible plain-value bodies.
 - **Node parity pack** (issue #3 follow-up): real `Buffer` (Uint8Array
   subclass, Node encodings + LE/BE accessors), `URL`/`URLSearchParams`
   (WHATWG subset verified against real Node), `console.time`/`table`/
