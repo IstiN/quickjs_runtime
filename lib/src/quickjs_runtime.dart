@@ -23,9 +23,15 @@ class QuickjsRuntime {
   Pointer<Void> _context;
   final _callables = <NativeCallable>[];
 
+  /// Whether a successful top-level [eval] automatically drains the
+  /// microtask queue (promise reactions). Node and GraalJS both run pending
+  /// jobs when a script finishes, so the default mirrors them; pass `false`
+  /// for the old strict behavior (drain only via [drainMicrotasks]).
+  final bool autoDrainMicrotasks;
+
   /// Creates a new runtime with a fresh context and an empty host callback
   /// registry.
-  QuickjsRuntime()
+  QuickjsRuntime({this.autoDrainMicrotasks = true})
       : _ffi = QuickjsFfi(),
         _runtime = nullptr,
         _context = nullptr {
@@ -43,7 +49,18 @@ class QuickjsRuntime {
     String filename = '<eval>',
     List<String?>? errMsg,
   }) {
-    return _ffi.eval(_context, code, filename, errMsg);
+    final result = _ffi.eval(_context, code, filename, errMsg);
+    // Node/GraalJS parity: promise reactions queued by the script run when
+    // the script completes. Capped so a self-re-enqueueing chain cannot
+    // hang; a job that throws is reported on stderr and stops the drain.
+    // Note: `_ffi.eval` returns null both for a thrown script (errMsg set)
+    // and for a JS-undefined completion value (very common for statement
+    // lists) — only the error case must skip the drain.
+    final failed = errMsg != null && errMsg.isNotEmpty && errMsg.first != null;
+    if (!failed && autoDrainMicrotasks) {
+      drainMicrotasks();
+    }
+    return result;
   }
 
   /// Registers a host function callable from JS.
@@ -86,6 +103,30 @@ class QuickjsRuntime {
   /// Mirrors `executePendingJob()` in the flutter_js backend: call it after
   /// every eval that may settle promises so `.then` continuations run.
   int executePendingJobs() => _ffi.executePendingJobs(_context);
+
+  /// Blocks the calling thread for [ms] milliseconds.
+  ///
+  /// Returns `false` when the loaded library predates `qjs_sleep_ms`; the
+  /// node-compat timer pump then degrades to ready-only draining.
+  bool sleepMs(int ms) => _ffi.sleepMs(ms);
+
+  /// Drains the microtask queue, executing at most [maxJobs] promise
+  /// reactions. The cap exists because a self-re-enqueueing chain
+  /// (`function f(){ Promise.resolve().then(f); } f();`) would otherwise
+  /// loop forever — [eval]'s auto-drain uses the same guard.
+  ///
+  /// Returns the number of executed jobs; stops early (returning what ran)
+  /// when a job throws — the error is reported on stderr by the C bridge.
+  int drainMicrotasks({int maxJobs = 100000}) {
+    if (maxJobs <= 0) return 0;
+    var executed = 0;
+    while (executed < maxJobs) {
+      final rc = _ffi.executePendingJobsCapped(_context, maxJobs - executed);
+      if (rc <= 0) break; // queue empty, unsupported library, or job error
+      executed += rc;
+    }
+    return executed;
+  }
 
   /// Releases all resources: the registered callbacks, then the QuickJS
   /// context and runtime. Safe to call once; a no-op thereafter.

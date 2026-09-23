@@ -15,6 +15,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <errno.h>
 
 #define MAX_HOST_FNS 65536
 
@@ -197,6 +199,52 @@ int qjs_execute_pending_jobs(JSContext* ctx) {
         executed++;
     }
     return executed;
+}
+
+/* Capped variant of qjs_execute_pending_jobs: stops after [max_jobs]
+ * executed jobs so a self-re-enqueueing microtask chain cannot hang the
+ * host thread. New symbol (the uncapped one keeps its original signature
+ * so older Dart code against older builds stays ABI-safe). Returns the
+ * number of executed jobs, or -1 if a job raised an exception (reported
+ * on stderr, cleared). */
+int qjs_execute_pending_jobs_capped(JSContext* ctx, int max_jobs) {
+    JSRuntime* rt = JS_GetRuntime(ctx);
+    int executed = 0;
+    for (;;) {
+        JSContext* ctx1;
+        int rc = JS_ExecutePendingJob(rt, &ctx1);
+        if (rc == 0) break;
+        if (rc < 0) {
+            JSValue err = JS_GetException(ctx1);
+            const char* msg = JS_ToCString(ctx1, err);
+            fprintf(stderr, "[quickjs] pending job error: %s\n",
+                    msg ? msg : "(unknown)");
+            if (msg) JS_FreeCString(ctx1, msg);
+            JS_FreeValue(ctx1, err);
+            return -1;
+        }
+        executed++;
+        if (executed >= max_jobs) break;
+    }
+    return executed;
+}
+
+/* Blocks the calling thread for [ms] milliseconds. Used by the node-compat
+ * timer pump in 'block' mode (setTimeout with a future due time). Returns
+ * 0 on success. */
+int qjs_sleep_ms(int ms) {
+    if (ms <= 0) return 0;
+#ifdef _WIN32
+    Sleep((DWORD)ms);
+#else
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {
+        /* resume the remaining time after a signal */
+    }
+#endif
+    return 0;
 }
 
 /* Set a global variable from a JSON string. Returns 0 on success. */

@@ -1,5 +1,17 @@
 # Unreleased
 
+- **Real timers + `events` + microtask auto-drain.** Promise reactions
+  now drain automatically after every eval (capped; Node/GraalJS
+  parity — `.then`/`queueMicrotask`/`process.nextTick`/`util.promisify`
+  work out of the box; previously reactions never ran). Timers are a
+  real sync-drain scheduler driven by `NodeCompatHandle.drainTimers()`
+  in three modes (`none`/`ready`/`block`) with injectable clock +
+  blocking sleep (`qjs_sleep_ms`), unref'd-timer semantics, a
+  per-pass callback cap and a wall-clock bound. `require('events')`
+  ships a 1:1 synchronous `EventEmitter`. `util.callbackify` joins
+  `promisify` as real. New additive C symbols
+  (`qjs_execute_pending_jobs_capped`, `qjs_sleep_ms`) — older .so
+  builds keep working via guarded lookups.
 - **Sync `fetch`** behind `NodeCompatConfig.httpFetch` (embedding
   provides the transport): real `fetch`/`Headers`/`Response` —
   case-insensitive headers, one-shot body accessors, `TypeError:

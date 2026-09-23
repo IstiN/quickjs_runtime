@@ -192,8 +192,7 @@ void main() {
     });
 
     test('signal is accepted and ignored (documented)', () {
-      expect(js(
-          "fetch('http://api.test/text', { signal: undefined }).text()"),
+      expect(js("fetch('http://api.test/text', { signal: undefined }).text()"),
           'plain text body');
     });
   });

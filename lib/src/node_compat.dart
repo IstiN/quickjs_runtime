@@ -13,10 +13,19 @@
 /// tools).
 ///
 /// **Tier 2 — known-unsupported, self-documenting stubs:** touching
-/// `Buffer`, `fetch`, `AbortController`, `setTimeout`, `setInterval`,
-/// `setImmediate`, or `process.nextTick` throws a message naming the
-/// alternative — an intentional error beats a bare `ReferenceError` for
-/// script authors (human or AI).
+/// `fetch` (without a [NodeCompatConfig.httpFetch] transport) or
+/// `AbortController` throws a message naming the alternative — an
+/// intentional error beats a bare `ReferenceError` for script authors
+/// (human or AI).
+///
+/// **Timers are real** but host-driven, because there is no background
+/// event loop: `setTimeout`/`setInterval`/`setImmediate`/`queueMicrotask`
+/// register work and [NodeCompatHandle.drainTimers] runs it at the
+/// embedding's chosen checkpoints (three modes, default one ready-pass per
+/// call). Promise reactions drain automatically after every
+/// `QuickjsRuntime.eval`. The `events` module is 1:1 — Node's
+/// EventEmitter is synchronous. See the README for the exact deviation
+/// list vs Node.
 ///
 /// Everything is opt-in: an unmodified `QuickjsRuntime` keeps its
 /// clean-room ES2020 surface until [installNodeCompat] runs.
@@ -68,6 +77,10 @@ class NodeCompatConfig {
     this.homedir,
     this.cpusCount,
     this.httpFetch,
+    this.timerDrain = TimerDrainMode.ready,
+    this.maxTimerCallbacks = 1000,
+    this.maxTimerDrainWallClock = const Duration(seconds: 30),
+    this.sleep,
   });
 
   /// `process.env` snapshot.
@@ -144,14 +157,59 @@ class NodeCompatConfig {
   /// `TypeError: fetch failed` with `cause`, like Node). When set, the
   /// real `fetch`/`Headers`/`Response` globals replace the tier-2 stub.
   final String? Function(String requestJson)? httpFetch;
+
+  /// How [NodeCompatHandle.drainTimers] runs due timers and immediates.
+  ///
+  /// - [TimerDrainMode.none]: timers are inert (calling them still registers
+  ///   them, but nothing ever fires) — for embeddings that drive draining
+  ///   themselves through raw evals.
+  /// - [TimerDrainMode.ready] (default): one pass — what is due *now* runs,
+  ///   future timers are left queued. Safe everywhere, including UI isolates.
+  /// - [TimerDrainMode.block]: loops, blocking the thread (via [sleep]) until
+  ///   the earliest ref'd timer is due, the queue empties, [maxTimerCallbacks]
+  ///   or [maxTimerDrainWallClock] is hit. For CLI embeddings (dmtools) where
+  ///   "setTimeout as sleep" must behave like Node.
+  ///
+  /// Scripts are the only activity in this runtime (I/O is synchronous), so a
+  /// blocking drain is semantically faithful: there is nothing to multiplex
+  /// except timers. Timer callbacks run between script statements, never
+  /// inside one — see the README for the exact deviation list vs Node.
+  final TimerDrainMode timerDrain;
+
+  /// Maximum timer/immediate callbacks a single [NodeCompatHandle.drainTimers]
+  /// pass may run before raising — the `setInterval(fn, 0)` storm guard.
+  final int maxTimerCallbacks;
+
+  /// Wall-clock bound for a blocking drain ([TimerDrainMode.block]).
+  final Duration maxTimerDrainWallClock;
+
+  /// Blocking sleep for [TimerDrainMode.block]. Defaults to the C bridge's
+  /// `qjs_sleep_ms` (a no-op when the loaded library predates it, which makes
+  /// a blocking drain degrade to ready-only).
+  final void Function(Duration duration)? sleep;
+}
+
+/// Timer draining strategy — see [NodeCompatConfig.timerDrain].
+enum TimerDrainMode { none, ready, block }
+
+/// Stats from a [NodeCompatHandle.drainTimers] run.
+class TimerDrainStats {
+  const TimerDrainStats({required this.ran, required this.pending});
+
+  /// Timer + immediate callbacks executed.
+  final int ran;
+
+  /// Timers still queued (intervals and not-yet-due timeouts).
+  final int pending;
 }
 
 /// Returned by [installNodeCompat] so the embedding can adjust per-script
 /// state after install (and tear the surface down with [dispose]).
 class NodeCompatHandle {
-  NodeCompatHandle._(this._runtime);
+  NodeCompatHandle._(this._runtime, this._cfg);
 
   final QuickjsRuntime _runtime;
+  final NodeCompatConfig _cfg;
 
   /// Updates `__filename` / `__dirname` and `process.argv[1]` to [path].
   void setScriptPath(String path) {
@@ -159,6 +217,90 @@ class NodeCompatHandle {
       'globalThis.__ncSetScriptPath(${jsonEncode(path)});',
       filename: '<node_compat_script_path>',
     );
+  }
+
+  double _nowMs() =>
+      _cfg.clock?.call() ?? DateTime.now().millisecondsSinceEpoch.toDouble();
+
+  void _sleep(Duration duration) {
+    final hook = _cfg.sleep;
+    if (hook != null) {
+      hook(duration);
+      return;
+    }
+    _runtime.sleepMs(duration.inMilliseconds);
+  }
+
+  /// Drains due timers and immediates, per [NodeCompatConfig.timerDrain].
+  ///
+  /// - `ready` (default): runs what is due now (plus microtasks), leaves
+  ///   future timers queued. Safe on UI isolates.
+  /// - `block`: additionally sleeps until the earliest ref'd timer is due
+  ///   and keeps draining until the queue empties, [maxTimerDrainWallClock]
+  ///   elapses (raises), or [maxTimerCallbacks] is exceeded per pass
+  ///   (raises — the `setInterval(fn, 0)` storm guard). Unref'd timers do
+  ///   not hold the drain.
+  ///
+  /// Timer callbacks run between passes, never re-entrantly inside a
+  /// callback: this calls into JS as a fresh top-level eval.
+  TimerDrainStats drainTimers({Duration? deadline}) {
+    if (_cfg.timerDrain == TimerDrainMode.none) {
+      return const TimerDrainStats(ran: 0, pending: 0);
+    }
+    final wall = Stopwatch()..start();
+    final limit = deadline ?? _cfg.maxTimerDrainWallClock;
+    var ran = 0;
+    while (true) {
+      final errMsg = <String?>[null];
+      // eval JSON-encodes the returned object; jsonDecode gives the status
+      // map directly (no JS-side stringify — that would double-encode).
+      final raw = _runtime.eval(
+        'globalThis.__ncTimerDrain()',
+        filename: '<node_compat_timer_drain>',
+        errMsg: errMsg,
+      );
+      if (raw == null) {
+        throw StateError(
+            'node_compat timer drain failed: ${errMsg[0] ?? "unknown"}');
+      }
+      final st = jsonDecode(raw) as Map<String, dynamic>;
+      if (st['capped'] == true) {
+        throw StateError('node_compat timer drain exceeded maxTimerCallbacks '
+            '(${_cfg.maxTimerCallbacks}) — possible setInterval(fn, 0) storm');
+      }
+      ran += (st['ran'] as num).toInt();
+      // promise reactions queued by callbacks run before the next pass
+      _runtime.drainMicrotasks();
+
+      final nextDue = st['nextDue'];
+      if (_cfg.timerDrain != TimerDrainMode.block || nextDue == null) {
+        final pending = _runtime.eval(
+          'globalThis.__ncTimerPendingCount()',
+          filename: '<node_compat_timer_drain>',
+        );
+        return TimerDrainStats(
+          ran: ran,
+          pending: pending == null ? 0 : int.parse(pending),
+        );
+      }
+      final waitMs = (nextDue as num).toDouble() - _nowMs();
+      if (waitMs <= 0) continue;
+      if (wall.elapsed >= limit) {
+        throw StateError(
+            'node_compat timer drain exceeded maxTimerDrainWallClock '
+            '(${_cfg.maxTimerDrainWallClock}) with '
+            '${_runtime.eval('globalThis.__ncTimerPendingCount()')} timers '
+            'still pending — an interval that never ends?');
+      }
+      final remaining = limit - wall.elapsed;
+      var sleepFor = waitMs;
+      if (Duration(milliseconds: sleepFor.round()) > remaining) {
+        sleepFor = remaining.inMilliseconds.toDouble();
+      }
+      if (sleepFor > 0) {
+        _sleep(Duration(milliseconds: sleepFor.round()));
+      }
+    }
   }
 }
 
@@ -188,8 +330,8 @@ NodeCompatHandle installNodeCompat(
     'tmpdir': cfg.tmpdir?.call(),
     'homedir': cfg.homedir?.call(),
   });
-  host(
-      '__ncCwd', (_) => jsonEncode(cfg.cwd?.call() ?? '/'));
+  runtime.setGlobal('__ncMaxTimerCallbacks', cfg.maxTimerCallbacks);
+  host('__ncCwd', (_) => jsonEncode(cfg.cwd?.call() ?? '/'));
   host('__ncNow', (_) {
     final ms =
         cfg.clock?.call() ?? DateTime.now().millisecondsSinceEpoch.toDouble();
@@ -244,7 +386,7 @@ NodeCompatHandle installNodeCompat(
   if (cfg.httpFetch != null) {
     runtime.eval(nodeCompatFetchPrelude, filename: '<node_compat_fetch>');
   }
-  return NodeCompatHandle._(runtime);
+  return NodeCompatHandle._(runtime, cfg);
 }
 
 /// Registers (or replaces) one consumer-provided builtin module visible
@@ -296,8 +438,7 @@ String _pseudoUuid() {
 // codecs must match Node byte-for-byte, hooks are for override only.
 List<int> _utf8Bytes(String text) => utf8.encode(text);
 
-String _utf8String(List<int> bytes) =>
-    utf8.decode(bytes, allowMalformed: true);
+String _utf8String(List<int> bytes) => utf8.decode(bytes, allowMalformed: true);
 
 // Minimal base64 (RFC 4648) for the no-hook default path.
 const String _b64alphabet =
@@ -608,8 +749,15 @@ const String nodeCompatPrelude = r'''
             }
             throw new Error('ProcessExit: ' + (code || 0));
         },
-        nextTick: unsupported('process.nextTick',
-            'no scheduling beyond promises — run the work directly')
+        // Deviation vs Node: mapped onto the microtask queue, so
+        // nextTick callbacks interleave in promise order instead of
+        // running before all promise reactions.
+        nextTick: function (fn) {
+            if (typeof fn !== 'function') {
+                throw new TypeError('process.nextTick callback must be a function');
+            }
+            Promise.resolve().then(fn);
+        }
     };
     process.hrtime.bigint = function () {
         var ms = monoMs();
@@ -861,6 +1009,58 @@ const String nodeCompatPrelude = r'''
         format: format,
         types: {
             isPromise: function (v) { return v instanceof Promise; }
+        },
+        // Node-shaped promisify: last-argument (err, value) callback →
+        // Promise. Real since the microtask queue is drained by the host.
+        promisify: function (fn) {
+            if (typeof fn !== 'function') {
+                throw new TypeError(
+                    'util.promisify argument must be a function');
+            }
+            if (fn.__ncPromisified) return fn;
+            var wrapped = function () {
+                var self = this;
+                var args = Array.prototype.slice.call(arguments);
+                return new Promise(function (resolve, reject) {
+                    args.push(function (err, value) {
+                        if (err) reject(err); else resolve(value);
+                    });
+                    try {
+                        fn.apply(self, args);
+                    } catch (e) {
+                        reject(e);
+                    }
+                });
+            };
+            wrapped.__ncPromisified = true;
+            return wrapped;
+        },
+        // Node-shaped callbackify: Promise-returning function →
+        // (err, value) callback style; rejections surface as the err
+        // argument.
+        callbackify: function (fn) {
+            if (typeof fn !== 'function') {
+                throw new TypeError(
+                    'util.callbackify argument must be a function');
+            }
+            return function () {
+                var self = this;
+                var args = Array.prototype.slice.call(arguments);
+                var cb = args.pop();
+                if (typeof cb !== 'function') {
+                    throw new TypeError(
+                        'util.callbackify last argument must be a function');
+                }
+                try {
+                    fn.apply(self, args).then(
+                        function (value) { cb(null, value); },
+                        function (err) {
+                            cb(err || new Error('falsy rejection'));
+                        });
+                } catch (e) {
+                    cb(e);
+                }
+            };
         }
     };
 
@@ -873,7 +1073,8 @@ const String nodeCompatPrelude = r'''
         util: function () { return globalThis.util; },
         os: function () { return osModule; },
         url: function () { return globalThis.__ncRegistry.url(); },
-        buffer: function () { return globalThis.__ncRegistry.buffer(); }
+        buffer: function () { return globalThis.__ncRegistry.buffer(); },
+        events: function () { return eventsModule; }
     };
     var baseRequire = typeof require === 'function' ? require : null;
     function compatRequire(name) {
@@ -885,7 +1086,7 @@ const String nodeCompatPrelude = r'''
         }
         if (baseRequire) return baseRequire(name);
         throw new Error("Cannot find module '" + name +
-            "' (compat builtins: path, assert, util, os, url, buffer" +
+            "' (compat builtins: path, assert, util, os, url, buffer, events" +
             (Object.keys(registry).length
                 ? '; consumer-registered: ' + Object.keys(registry).join(', ')
                 : '') + ')');
@@ -916,6 +1117,167 @@ const String nodeCompatPrelude = r'''
                 : [String(locales)];
         }
     };
+
+    // ── events builtin module (require('events'); no global, like Node) ──
+    // Node's EventEmitter is fully synchronous — emit() calls listeners
+    // inline — so this is 1:1 with Node without any event loop.
+    function EventEmitter() {
+        this._ncEvents = {};
+        this._ncMax = EventEmitter.defaultMaxListeners;
+    }
+    EventEmitter.defaultMaxListeners = 10;
+    EventEmitter.EventEmitter = EventEmitter;
+    EventEmitter.listenerCount = function (emitter, type) {
+        return typeof emitter.listenerCount === 'function'
+            ? emitter.listenerCount(type)
+            : 0;
+    };
+    function eeWrap(emitter, type, listener, prepend) {
+        if (typeof listener !== 'function') {
+            throw new TypeError('listener must be a function');
+        }
+        var list = emitter._ncEvents[type] ||
+            (emitter._ncEvents[type] = []);
+        var entry = { listener: listener, wrapped: null, once: false };
+        // 'newListener' fires before adding (Node semantics)
+        if (type !== 'newListener' && type !== 'removeListener' &&
+            emitter._ncEvents.newListener && emitter._ncEvents.newListener.length) {
+            emitter.emit('newListener', type, listener);
+        }
+        if (prepend === true) {
+            list.unshift(entry);
+        } else {
+            list.push(entry);
+        }
+        if (list.length > emitter._ncMax && emitter._ncMax > 0) {
+            console.warn('MaxListenersExceededWarning: ' + list.length +
+                ' ' + type + ' listeners added to an EventEmitter');
+        }
+        return emitter;
+    }
+    EventEmitter.prototype.setMaxListeners = function (n) {
+        if (typeof n !== 'number' || n < 0 || n !== n /* NaN */) {
+            throw new RangeError(
+                'setMaxListeners: value must be a non-negative number');
+        }
+        this._ncMax = n;
+        return this;
+    };
+    EventEmitter.prototype.getMaxListeners = function () {
+        return this._ncMax;
+    };
+    EventEmitter.prototype.on = function (type, listener) {
+        return eeWrap(this, type, listener, false);
+    };
+    EventEmitter.prototype.addListener = EventEmitter.prototype.on;
+    EventEmitter.prototype.prependListener = function (type, listener) {
+        return eeWrap(this, type, listener, true);
+    };
+    EventEmitter.prototype.once = function (type, listener) {
+        if (typeof listener !== 'function') {
+            throw new TypeError('listener must be a function');
+        }
+        var self = this;
+        function wrapped() {
+            self.off(type, listener);
+            wrapped._ncFired = true;
+            listener.apply(this, arguments);
+        }
+        wrapped._ncOriginal = listener;
+        var list = self._ncEvents[type] || (self._ncEvents[type] = []);
+        var entry = { listener: listener, wrapped: wrapped, once: true };
+        if (type !== 'newListener' && type !== 'removeListener' &&
+            self._ncEvents.newListener) {
+            self.emit('newListener', type, listener);
+        }
+        list.push(entry);
+        if (list.length > self._ncMax && self._ncMax > 0) {
+            console.warn('MaxListenersExceededWarning: ' + list.length +
+                ' ' + type + ' listeners added to an EventEmitter');
+        }
+        return self;
+    };
+    EventEmitter.prototype.prependOnceListener = function (type, listener) {
+        if (typeof listener !== 'function') {
+            throw new TypeError('listener must be a function');
+        }
+        var self = this;
+        function wrapped() {
+            self.off(type, listener);
+            listener.apply(this, arguments);
+        }
+        wrapped._ncOriginal = listener;
+        var list = self._ncEvents[type] || (self._ncEvents[type] = []);
+        list.unshift({ listener: listener, wrapped: wrapped, once: true });
+        return self;
+    };
+    EventEmitter.prototype.off = function (type, listener) {
+        var list = this._ncEvents[type];
+        if (!list) return this;
+        for (var i = 0; i < list.length; i++) {
+            var entry = list[i];
+            if (entry.listener === listener ||
+                (entry.wrapped && entry.wrapped._ncOriginal === listener)) {
+                list.splice(i, 1);
+                if (this._ncEvents.removeListener) {
+                    this.emit('removeListener', type, listener);
+                }
+                return this;
+            }
+        }
+        return this;
+    };
+    EventEmitter.prototype.removeListener = EventEmitter.prototype.off;
+    EventEmitter.prototype.removeAllListeners = function (type) {
+        if (type === undefined) {
+            this._ncEvents = {};
+        } else {
+            delete this._ncEvents[type];
+        }
+        return this;
+    };
+    EventEmitter.prototype.emit = function (type) {
+        var args = Array.prototype.slice.call(arguments, 1);
+        var list = this._ncEvents[type];
+        var hadListener = !!(list && list.length);
+        if (type === 'error' && !hadListener) {
+            var err = args[0];
+            if (err instanceof Error) throw err;
+            var wrapErr = new Error('Unhandled error. (' + err + ')');
+            wrapErr.context = err;
+            throw wrapErr;
+        }
+        if (!hadListener) return false;
+        var calls = list.slice();
+        for (var i = 0; i < calls.length; i++) {
+            var entry = calls[i];
+            var fn = entry.wrapped || entry.listener;
+            if (entry.wrapped) {
+                // run once-wrapper then drop it (Node order: off before run)
+                var idx = list.indexOf(entry);
+                if (idx >= 0) list.splice(idx, 1);
+            }
+            fn.apply(this, args);
+        }
+        return true;
+    };
+    EventEmitter.prototype.listeners = function (type) {
+        var list = this._ncEvents[type] || [];
+        return list.map(function (e) { return e.listener; });
+    };
+    EventEmitter.prototype.rawListeners = function (type) {
+        var list = this._ncEvents[type] || [];
+        return list.map(function (e) { return e.wrapped || e.listener; });
+    };
+    EventEmitter.prototype.listenerCount = function (type) {
+        return (this._ncEvents[type] || []).length;
+    };
+    EventEmitter.prototype.eventNames = function () {
+        return Object.keys(this._ncEvents).filter(function (k) {
+            return this._ncEvents[k].length > 0;
+        }, this);
+    };
+    var eventsModule = EventEmitter;
 
     // ── os builtin module (require('os'); no global, like Node) ──
     var osModule = {
@@ -967,14 +1329,162 @@ const String nodeCompatPrelude = r'''
         'or runAsync(fn, args) for parallel engines');
     globalThis.AbortController = unsupported('AbortController',
         'no async operations in this runtime — nothing to abort');
-    globalThis.setTimeout = unsupported('setTimeout',
-        'no event loop in v1 — run the work directly, or use runAsync ' +
-        'for parallel engines');
-    globalThis.clearTimeout = function () {};
-    globalThis.setInterval = unsupported('setInterval',
-        'no event loop in v1 — run the work directly');
-    globalThis.clearInterval = function () {};
-    globalThis.setImmediate = unsupported('setImmediate',
-        'no event loop in v1 — run the work directly');
+
+    // ── timers: real, sync-drain scheduler ──
+    // There is no background event loop: the host drives __ncTimerDrain()
+    // through NodeCompatHandle.drainTimers() at its chosen checkpoints and
+    // (in 'block' mode) sleeps between passes. Ordering matches Node for the
+    // common cases: sync code always runs before any timer, immediates run
+    // before due timeouts, earliest due first.
+    var __timerSeq = 1;
+    var __pendingTimers = {};
+    var __immediates = [];
+    function __timerHandle(id) {
+        return {
+            _ncId: id,
+            unref: function () {
+                var t = __pendingTimers[id];
+                if (t) t.unref = true;
+                return this;
+            },
+            ref: function () {
+                var t = __pendingTimers[id];
+                if (t) t.unref = false;
+                return this;
+            },
+            hasRef: function () {
+                var t = __pendingTimers[id];
+                return !!(t && !t.unref);
+            },
+            refresh: function () {
+                var t = __pendingTimers[id];
+                if (t) t.due = __ncNow() + t.ms;
+                return this;
+            }
+        };
+    }
+    function __immediateHandle(entry) {
+        return {
+            _ncImmEntry: entry,
+            unref: function () { return this; },
+            ref: function () { return this; },
+            hasRef: function () { return true; }
+        };
+    }
+    function __addTimer(fn, ms, args, repeat) {
+        if (typeof fn !== 'function') {
+            throw new TypeError('timer callback must be a function');
+        }
+        var delay = Math.max(0, Number(ms) || 0);
+        var id = __timerSeq++;
+        __pendingTimers[id] = {
+            fn: fn, ms: repeat ? delay : 0, args: args,
+            due: __ncNow() + delay, repeat: !!repeat, unref: false
+        };
+        return __timerHandle(id);
+    }
+    globalThis.setTimeout = function (fn, ms) {
+        return __addTimer(fn, ms, Array.prototype.slice.call(arguments, 2),
+            false);
+    };
+    globalThis.setInterval = function (fn, ms) {
+        return __addTimer(fn, ms, Array.prototype.slice.call(arguments, 2),
+            true);
+    };
+    globalThis.setImmediate = function (fn) {
+        if (typeof fn !== 'function') {
+            throw new TypeError('timer callback must be a function');
+        }
+        var entry = {
+            fn: fn,
+            args: Array.prototype.slice.call(arguments, 1),
+            cancelled: false
+        };
+        __immediates.push(entry);
+        return __immediateHandle(entry);
+    };
+    function __clear(handle) {
+        if (!handle) return;
+        if (handle._ncImmEntry !== undefined) {
+            handle._ncImmEntry.cancelled = true;
+            return;
+        }
+        if (handle._ncId !== undefined) {
+            delete __pendingTimers[handle._ncId];
+        }
+    }
+    globalThis.clearTimeout = __clear;
+    globalThis.clearInterval = __clear;
+    globalThis.clearImmediate = __clear;
+    // Drains everything due right now. The host calls this via
+    // NodeCompatHandle.drainTimers(); it returns a status object the host
+    // uses to decide whether (and how long) to sleep before the next pass.
+    globalThis.__ncTimerDrain = function () {
+        var ran = 0, now, best, id, t, i, im;
+        // immediates first (setImmediate ≈ Node's check phase); consumed
+        // slots are nulled in place so a capped mid-pass return never
+        // re-runs them on the next pass
+        for (i = 0; i < __immediates.length; i++) {
+            if (ran >= __ncMaxTimerCallbacks) {
+                return { ran: ran, capped: true, nextDue: null };
+            }
+            im = __immediates[i];
+            if (im && !im.cancelled) {
+                im.fn.apply(null, im.args);
+                ran++;
+                __immediates[i] = null;
+            }
+        }
+        __immediates = __immediates.filter(function (x) { return x; });
+        // due timeouts/intervals, earliest first
+        for (;;) {
+            if (ran >= __ncMaxTimerCallbacks) {
+                return { ran: ran, capped: true, nextDue: null };
+            }
+            now = __ncNow();
+            best = null;
+            for (id in __pendingTimers) {
+                t = __pendingTimers[id];
+                if (t.due > now) continue;
+                if (best === null || t.due < __pendingTimers[best].due) {
+                    best = id;
+                }
+            }
+            if (best === null) break;
+            t = __pendingTimers[best];
+            if (t.repeat) {
+                t.due = now + t.ms;
+            } else {
+                delete __pendingTimers[best];
+            }
+            t.fn.apply(null, t.args);
+            ran++;
+        }
+        // earliest ref'd future timer (unref'd ones must not hold the host)
+        var nextDue = null;
+        for (id in __pendingTimers) {
+            t = __pendingTimers[id];
+            if (t.unref) continue;
+            if (nextDue === null || t.due < nextDue) nextDue = t.due;
+        }
+        return { ran: ran, capped: false, nextDue: nextDue };
+    };
+    globalThis.__ncTimerPendingCount = function () {
+        var n = 0, id, i;
+        for (id in __pendingTimers) n++;
+        for (i = 0; i < __immediates.length; i++) {
+            if (__immediates[i] && !__immediates[i].cancelled) n++;
+        }
+        return n;
+    };
+
+    // queueMicrotask: real, on the native promise queue (drained by the
+    // runtime after each eval).
+    globalThis.queueMicrotask = function (fn) {
+        if (typeof fn !== 'function') {
+            throw new TypeError('queueMicrotask callback must be a function');
+        }
+        Promise.resolve().then(fn);
+    };
 })();
 ''';
