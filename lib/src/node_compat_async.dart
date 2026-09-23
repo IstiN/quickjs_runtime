@@ -12,6 +12,10 @@ const String nodeCompatAsyncPrelude = r'''
         { env: {}, platform: 'linux', arch: 'x64', nodeVersion: 'v22.0.0-compat' };
     var builtins = globalThis.__ncBuiltins || {};
     var unsupported = globalThis.__ncUnsupported;
+    var envObj = {};
+    Object.keys(cfg.env || {}).forEach(function (k) {
+        envObj[k] = String(cfg.env[k]);
+    });
     // ── events builtin module (require('events'); no global, like Node) ──
     // Node's EventEmitter is fully synchronous — emit() calls listeners
     // inline — so this is 1:1 with Node without any event loop.

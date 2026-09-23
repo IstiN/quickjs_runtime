@@ -4,3 +4,4 @@ native/quickjs/libquickjs_bridge.so
 *.iml
 .pub
 /build
+coverage/
