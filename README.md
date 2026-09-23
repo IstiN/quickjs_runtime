@@ -78,6 +78,41 @@ blocks its caller forever, like any infinite script loop.
 
 VM-only (`dart:ffi`): never import from a web-reachable path.
 
+## Node/js compat layer (opt-in)
+
+The bare runtime is a clean-room ES2020 — no `console`, `process`,
+`setTimeout`. `installNodeCompat` adds the idioms scripts habitually
+reach for, and turns the unsupported ones into self-documenting errors
+instead of bare `ReferenceError`s:
+
+```dart
+installNodeCompat(rt, NodeCompatConfig(
+  env: platformEnv,          // process.env snapshot
+  cwd: () => dir,            // process.cwd() / path.resolve base
+  randomBytes: secureRandom, // crypto.getRandomValues
+  consoleSink: (level, msg) => myLog(level, msg),
+));
+```
+
+```js
+global === globalThis;                 // true
+path.join('a', 'b');                   // 'a/b'
+process.env.HOME;                      // from the snapshot
+require('assert').equal(2 + 2, 4);
+new TextEncoder().encode('hi');        // Uint8Array
+btoa('hello');                         // 'aGVsbG8='
+structuredClone(v);                    // JSON fidelity
+setTimeout(f, 10);                     // throws: no event loop — use
+                                       // runAsync or run the work directly
+typeof Buffer;                         // 'function' (guard-safe)
+Buffer(1);                             // throws: use TextEncoder/atob
+```
+
+Builtin modules via `require`: `path`, `assert`, `util`. Consumers can
+register more (`installNodeCompatModule(rt, 'fs', factory)`) and a
+pre-existing `require` loader stays reachable as the fallback.
+
+
 ## Testing
 
 ```sh
