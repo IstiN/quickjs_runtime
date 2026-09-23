@@ -154,32 +154,15 @@ class NodeCompatHandle {
 
 /// Installs the compat layer onto [runtime]. Idempotent per runtime
 /// (reinstalling replaces the previous surface).
-NodeCompatHandle installNodeCompat(
-  QuickjsRuntime runtime, [
-  NodeCompatConfig? config,
-]) {
-  final cfg = config ?? const NodeCompatConfig();
-  void host(String name, String? Function(String argsJson) fn) {
-    // registerHostFunction keeps its own alive list; we mirror it so
-    // NodeCompatHandle.dispose can release them deterministically.
-    runtime.registerHostFunction(name, fn);
-  }
-
-  runtime.setGlobal('__ncConfig', {
-    'env': cfg.env,
-    'platform': cfg.platform,
-    'arch': cfg.arch,
-    'nodeVersion': cfg.nodeVersion,
-    'argv': cfg.argv,
-    'scriptPath': cfg.scriptPath,
-    'pid': cfg.pid?.call() ?? 1,
-    'cpusCount': cfg.cpusCount?.call() ?? 1,
-    'hostname': cfg.hostname?.call() ?? 'localhost',
-    'tmpdir': cfg.tmpdir?.call(),
-    'homedir': cfg.homedir?.call(),
-  });
-  host(
-      '__ncCwd', (_) => jsonEncode(cfg.cwd?.call() ?? '/'));
+/// Registers the JSON host hooks the compat prelude calls into
+/// (`__ncCwd`, `__ncNow`, console sink, crypto/utf-8/base64 codecs, exit).
+/// Each hook consults [cfg] first and falls back to the pure-Dart default.
+void _registerCompatHosts(
+  QuickjsRuntime runtime,
+  NodeCompatConfig cfg,
+  void Function(String name, String? Function(String argsJson) fn) host,
+) {
+  host('__ncCwd', (_) => jsonEncode(cfg.cwd?.call() ?? '/'));
   host('__ncNow', (_) {
     final ms =
         cfg.clock?.call() ?? DateTime.now().millisecondsSinceEpoch.toDouble();
@@ -223,6 +206,35 @@ NodeCompatHandle installNodeCompat(
     cfg.exitHook?.call(jsonDecode(argsJson) as int);
     return null;
   });
+}
+
+/// Installs the compat layer onto [runtime]. Idempotent per runtime
+/// (reinstalling replaces the previous surface).
+NodeCompatHandle installNodeCompat(
+  QuickjsRuntime runtime, [
+  NodeCompatConfig? config,
+]) {
+  final cfg = config ?? const NodeCompatConfig();
+  void host(String name, String? Function(String argsJson) fn) {
+    // registerHostFunction keeps its own alive list; we mirror it so
+    // NodeCompatHandle.dispose can release them deterministically.
+    runtime.registerHostFunction(name, fn);
+  }
+
+  runtime.setGlobal('__ncConfig', {
+    'env': cfg.env,
+    'platform': cfg.platform,
+    'arch': cfg.arch,
+    'nodeVersion': cfg.nodeVersion,
+    'argv': cfg.argv,
+    'scriptPath': cfg.scriptPath,
+    'pid': cfg.pid?.call() ?? 1,
+    'cpusCount': cfg.cpusCount?.call() ?? 1,
+    'hostname': cfg.hostname?.call() ?? 'localhost',
+    'tmpdir': cfg.tmpdir?.call(),
+    'homedir': cfg.homedir?.call(),
+  });
+  _registerCompatHosts(runtime, cfg, host);
   runtime.eval(nodeCompatPrelude, filename: '<node_compat>');
   runtime.eval(nodeCompatBufferPrelude, filename: '<node_compat_buffer>');
   runtime.eval(nodeCompatUrlPrelude, filename: '<node_compat_url>');
@@ -254,20 +266,33 @@ String _safeName(String name) => name.replaceAll(RegExp(r'[^A-Za-z0-9_]'), '_');
 
 // ── Default (non-secure / approximating) fallbacks ──
 
-int _pseudoState = 0x2545F491;
+/// Base64 arithmetic 4-bit mask (also reused by the UUID nibble layout).
+const int _b64QuadMask = 0x0F;
+
+/// RFC 4122 UUIDv4 bit layout: version nibble + variant bits.
+const int _uuidNibbleMask = _b64QuadMask;
+const int _uuidVersion4 = 0x40;
+const int _uuidVariantMask = 0x3F;
+const int _uuidVariantBits = 0x80;
+
+/// LCG state seed and modulus for the non-secure fallback PRNG.
+const int _pseudoSeed = 0x2545F491;
+const int _pseudoMask = 0x7FFFFFFF;
+
+int _pseudoState = _pseudoSeed;
 
 List<int> _pseudoRandom(int count) => List<int>.generate(
       count,
       (_) =>
-          (_pseudoState = (_pseudoState * 1103515245 + 12345) & 0x7FFFFFFF) &
+          (_pseudoState = (_pseudoState * 1103515245 + 12345) & _pseudoMask) &
           0xFF,
       growable: false,
     );
 
 String _pseudoUuid() {
   final bytes = _pseudoRandom(16);
-  bytes[6] = (bytes[6] & 0x0F) | 0x40;
-  bytes[8] = (bytes[8] & 0x3F) | 0x80;
+  bytes[6] = (bytes[6] & _uuidNibbleMask) | _uuidVersion4;
+  bytes[8] = (bytes[8] & _uuidVariantMask) | _uuidVariantBits;
   String hex(int b) => b.toRadixString(16).padLeft(2, '0');
   final s = bytes.map(hex).join();
   return '${s.substring(0, 8)}-${s.substring(8, 12)}-'
@@ -278,8 +303,7 @@ String _pseudoUuid() {
 // codecs must match Node byte-for-byte, hooks are for override only.
 List<int> _utf8Bytes(String text) => utf8.encode(text);
 
-String _utf8String(List<int> bytes) =>
-    utf8.decode(bytes, allowMalformed: true);
+String _utf8String(List<int> bytes) => utf8.decode(bytes, allowMalformed: true);
 
 // Minimal base64 (RFC 4648) for the no-hook default path.
 const String _b64alphabet =
@@ -295,7 +319,9 @@ String _b64Encode(String text) {
     out.write(_b64alphabet[b0 >> 2]);
     out.write(_b64alphabet[((b0 & 0x03) << 4) | ((b1 ?? 0) >> 4)]);
     out.write(
-      b1 == null ? '=' : _b64alphabet[((b1 & 0x0F) << 2) | ((b2 ?? 0) >> 6)],
+      b1 == null
+          ? '='
+          : _b64alphabet[((b1 & _b64QuadMask) << 2) | ((b2 ?? 0) >> 6)],
     );
     out.write(b2 == null ? '=' : _b64alphabet[b2 & 0x3F]);
   }
@@ -311,7 +337,8 @@ String _b64Decode(String text) {
             i + k < clean.length ? _b64alphabet.indexOf(clean[i + k]) : 0)
         .toList();
     out.add((n[0] << 2) | (n[1] >> 4));
-    if (i + 2 < clean.length) out.add(((n[1] & 0x0F) << 4) | (n[2] >> 2));
+    if (i + 2 < clean.length)
+      out.add(((n[1] & _b64QuadMask) << 4) | (n[2] >> 2));
     if (i + 3 < clean.length) out.add(((n[2] & 0x03) << 6) | n[3]);
   }
   return _utf8String(out);
