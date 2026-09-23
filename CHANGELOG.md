@@ -1,5 +1,17 @@
 # Unreleased
 
+- **Node parity pack** (issue #3 follow-up): real `Buffer` (Uint8Array
+  subclass, Node encodings + LE/BE accessors), `URL`/`URLSearchParams`
+  (WHATWG subset verified against real Node), `console.time`/`table`/
+  `group`/`count`/`dir`/`trace`, Node-style `util.inspect`, `os` +
+  `url` + `buffer` builtin modules, `process.argv`/`pid`/`hrtime`/
+  `uptime`/`memoryUsage`/`stdout`/`stderr`/`on('exit')`,
+  `__filename`/`__dirname` (+ `NodeCompatHandle.setScriptPath`),
+  typeof-safe `Intl` stubs. Default text codecs are now real UTF-8
+  (dart:convert) — the latin-1 approximation is gone; `Buffer` removed
+  from tier-2 stubs; `installNodeCompat` returns a
+  `NodeCompatHandle`.
+
 - Node/js compat layer (issue #3), opt-in via `installNodeCompat(rt, cfg)`:
   - **Tier 1 — real:** `global`, `console.*` (pluggable sink), `process`
     (env/platform/arch/version/exitCode/cwd/exit), `path` (posix subset),

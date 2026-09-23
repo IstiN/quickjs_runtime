@@ -102,15 +102,36 @@ require('assert').equal(2 + 2, 4);
 new TextEncoder().encode('hi');        // Uint8Array
 btoa('hello');                         // 'aGVsbG8='
 structuredClone(v);                    // JSON fidelity
+Buffer.from('hi', 'utf8').toString('base64'); // 'aGk='
+new URL('?b=2', 'http://h/a?x=1').href;       // 'http://h/a?b=2'
+console.time('x'); console.timeEnd('x');      // 'x: 0.123ms'
 setTimeout(f, 10);                     // throws: no event loop — use
                                        // runAsync or run the work directly
-typeof Buffer;                         // 'function' (guard-safe)
-Buffer(1);                             // throws: use TextEncoder/atob
 ```
 
-Builtin modules via `require`: `path`, `assert`, `util`. Consumers can
-register more (`installNodeCompatModule(rt, 'fs', factory)`) and a
-pre-existing `require` loader stays reachable as the fallback.
+**Buffer** is a real `Uint8Array` subclass with the Node encodings
+(`utf8`/`utf16le`/`latin1`/`ascii`/`hex`/`base64`/`base64url`),
+`from`/`alloc`/`allocUnsafe`/`concat`/`byteLength`/`isBuffer`/`compare`,
+instance `toString`/`write`/`fill`/`copy`/`equals`/`indexOf`/`slice`/
+`toJSON` and the LE/BE `read*`/`write*` primitives over a `DataView`.
+
+**URL / URLSearchParams** implement the commonly scripted WHATWG subset:
+special-scheme default ports, relative resolution, live `searchParams`
+binding, `origin`, `canParse`/`parse`, form-urlencoded codec.
+
+**console** gains `time`/`timeEnd`/`timeLog`, `count`/`countReset`,
+`group`/`groupEnd`, `table`, `dir`, `trace`; `util.inspect` renders
+Node-style. **process** gains `argv`, `pid`, `execPath`, `hrtime`
+(+`.bigint()`), `uptime`, `memoryUsage`, `stdout`/`stderr` writes,
+`on('exit')` listeners; `__filename`/`__dirname` follow
+`NodeCompatConfig.scriptPath` (or `NodeCompatHandle.setScriptPath`).
+**Intl** constructors are typeof-safe call-time stubs (no ICU in
+QuickJS). Default text codecs are real UTF-8; hooks remain for override.
+
+Builtin modules via `require`: `path`, `assert`, `util`, `os`, `url`,
+`buffer`. Consumers can register more
+(`installNodeCompatModule(rt, 'fs', factory)`) and a pre-existing
+`require` loader stays reachable as the fallback.
 
 
 ## Testing
