@@ -35,6 +35,47 @@ rt.executePendingJobs();     // drain promise reactions
 rt.close();
 ```
 
+## Parallel engines (`runAsync`)
+
+`AsyncEnginePool` adds engine-level parallelism while keeping the
+scripting surface synchronous: `runAsync(fn, args)` returns a `Job`
+whose `wait()` blocks the calling engine (no promises, no event loop).
+
+```dart
+// Top-level (static) — it crosses the isolate spawn boundary.
+Future<void> workerMain(AsyncWorkerLink link) async {
+  final runtime = QuickjsRuntime();          // consumer wiring here
+  try {
+    while (true) {
+      final request = await link.next();
+      if (request == null) return;           // shutdown
+      link.complete(runAsyncJobOnRuntime(runtime,
+          jobId: request.jobId,
+          fnSource: request.fnSource,
+          argsJson: request.argsJson));
+    }
+  } finally {
+    runtime.close();
+  }
+}
+
+final pool = AsyncEnginePool(workers: 4, workerMain: workerMain);
+await pool.boot();                           // from main(), event loop alive
+pool.attachMainRuntime(rt);                  // adds runAsync/AsyncJob globals
+```
+
+```js
+// in JS
+var job = runAsync(function (x) { return expensive(x); }, [arg]);
+var result = job.wait();
+var all = runAsync.all([job1, job2, job3]).wait();
+```
+
+Boot the pool from `main()` **before** any JS evaluates —
+`Isolate.spawn` cannot progress while the isolate is blocked inside an
+FFI callback. No timeouts: a dispatched function that never returns
+blocks its caller forever, like any infinite script loop.
+
 VM-only (`dart:ffi`): never import from a web-reachable path.
 
 ## Testing
