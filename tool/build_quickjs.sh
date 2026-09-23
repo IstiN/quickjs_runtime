@@ -10,11 +10,24 @@ set -euo pipefail
 cd "$(dirname "$0")/../native/quickjs"
 
 CC="${CC:-gcc}"
+UNAME_S="$(uname -s)"
+
+# mingw-w64 (Git Bash / MSYS on Windows) has no libdl — dl* lives in
+# kernel32 — and -ldl makes ld fail with "cannot find -ldl". Downstream
+# consumers building the bridge on windows-latest runners currently work
+# around this with an empty stub archive exposed via LIBRARY_PATH
+# (dmtools-dart release-cli.yml); make the script itself Windows-honest
+# instead. The .so output name is kept everywhere: the Dart FFI resolver
+# hardcodes it and LoadLibrary ignores extensions.
+DL_LIB="-ldl"
+case "$UNAME_S" in
+  MINGW* | MSYS* | CYGWIN*) DL_LIB="" ;;
+esac
 
 "$CC" -shared -fPIC -O2 -D_GNU_SOURCE \
   -DCONFIG_VERSION='"2024-01-13"' -I. \
   -o libquickjs_bridge.so ../quickjs_bridge.c \
   quickjs.c libregexp.c libunicode.c cutils.c quickjs-libc.c libbf.c \
-  -lm -ldl -lpthread
+  -lm $DL_LIB -lpthread
 
 echo "built native/quickjs/libquickjs_bridge.so"
