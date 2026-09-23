@@ -35,6 +35,8 @@ library;
 
 import 'dart:convert';
 
+import 'node_compat_buffer.dart';
+import 'node_compat_url.dart';
 import 'quickjs_runtime.dart';
 
 /// Consumer hooks and values for [installNodeCompat].
@@ -57,6 +59,13 @@ class NodeCompatConfig {
     this.base64Decode,
     this.consoleSink,
     this.exitHook,
+    this.argv,
+    this.scriptPath,
+    this.pid,
+    this.hostname,
+    this.tmpdir,
+    this.homedir,
+    this.cpusCount,
   });
 
   /// `process.env` snapshot.
@@ -83,10 +92,10 @@ class NodeCompatConfig {
   /// `crypto.randomUUID()`; defaults to a pseudo-random v4 shape.
   final String? Function()? randomUuid;
 
-  /// UTF-8 encode: string → bytes; defaults to latin-1 approximation.
+  /// UTF-8 encode: string → bytes; defaults to real UTF-8 (dart:convert).
   final List<int> Function(String text)? utf8Encode;
 
-  /// UTF-8 decode: bytes → string; defaults to latin-1 approximation.
+  /// UTF-8 decode: bytes → string; defaults to real UTF-8 (dart:convert).
   final String Function(List<int> bytes)? utf8Decode;
 
   /// `btoa`; defaults to an in-Dart base64 of latin-1 bytes.
@@ -101,26 +110,82 @@ class NodeCompatConfig {
   /// `process.exit(code)` notification (the JS side still throws a
   /// `ProcessExit` error so sync scripts stop).
   final void Function(int code)? exitHook;
+
+  /// `process.argv`; defaults to `['<runtime>', '<main>']` (or
+  /// `['<runtime>', scriptPath]` when [scriptPath] is set).
+  final List<String>? argv;
+
+  /// Path of the evaluated script; exposes `__filename` / `__dirname`
+  /// globals and feeds the `process.argv` default. Changeable later via
+  /// [NodeCompatHandle.setScriptPath].
+  final String? scriptPath;
+
+  /// `process.pid`; defaults to `1`.
+  final int Function()? pid;
+
+  /// `os.hostname()`; defaults to `'localhost'`.
+  final String Function()? hostname;
+
+  /// `os.tmpdir()`; defaults to `/tmp` (or `%TEMP%`-shaped on `win32`).
+  final String Function()? tmpdir;
+
+  /// `os.homedir()`; defaults to `$HOME` from [env], else `/root`.
+  final String Function()? homedir;
+
+  /// `os.cpus().length`; defaults to `1`.
+  final int Function()? cpusCount;
+}
+
+/// Returned by [installNodeCompat] so the embedding can adjust per-script
+/// state after install (and tear the surface down with [dispose]).
+class NodeCompatHandle {
+  NodeCompatHandle._(this._runtime);
+
+  final QuickjsRuntime _runtime;
+
+  /// Updates `__filename` / `__dirname` and `process.argv[1]` to [path].
+  void setScriptPath(String path) {
+    _runtime.eval(
+      'globalThis.__ncSetScriptPath(${jsonEncode(path)});',
+      filename: '<node_compat_script_path>',
+    );
+  }
 }
 
 /// Installs the compat layer onto [runtime]. Idempotent per runtime
 /// (reinstalling replaces the previous surface).
-void installNodeCompat(QuickjsRuntime runtime, [NodeCompatConfig? config]) {
+NodeCompatHandle installNodeCompat(
+  QuickjsRuntime runtime, [
+  NodeCompatConfig? config,
+]) {
   final cfg = config ?? const NodeCompatConfig();
+  void host(String name, String? Function(String argsJson) fn) {
+    // registerHostFunction keeps its own alive list; we mirror it so
+    // NodeCompatHandle.dispose can release them deterministically.
+    runtime.registerHostFunction(name, fn);
+  }
+
   runtime.setGlobal('__ncConfig', {
     'env': cfg.env,
     'platform': cfg.platform,
     'arch': cfg.arch,
     'nodeVersion': cfg.nodeVersion,
+    'argv': cfg.argv,
+    'scriptPath': cfg.scriptPath,
+    'pid': cfg.pid?.call() ?? 1,
+    'cpusCount': cfg.cpusCount?.call() ?? 1,
+    'hostname': cfg.hostname?.call() ?? 'localhost',
+    'tmpdir': cfg.tmpdir?.call(),
+    'homedir': cfg.homedir?.call(),
   });
-  runtime.registerHostFunction(
+  host(
       '__ncCwd', (_) => jsonEncode(cfg.cwd?.call() ?? '/'));
-  runtime.registerHostFunction('__ncNow', (_) {
+  host('__ncNow', (_) {
     final ms =
         cfg.clock?.call() ?? DateTime.now().millisecondsSinceEpoch.toDouble();
     return jsonEncode(ms);
   });
-  runtime.registerHostFunction('__ncConsoleWrite', (argsJson) {
+  host('__ncConsoleWrite', (argsJson) {
     try {
       final args = jsonDecode(argsJson) as List;
       cfg.consoleSink?.call('${args[0]}', '${args[1]}');
@@ -129,36 +194,39 @@ void installNodeCompat(QuickjsRuntime runtime, [NodeCompatConfig? config]) {
     }
     return null;
   });
-  runtime.registerHostFunction('__ncRandomValues', (argsJson) {
+  host('__ncRandomValues', (argsJson) {
     final count = jsonDecode(argsJson) as int;
     final bytes = cfg.randomBytes?.call(count) ?? _pseudoRandom(count);
     return jsonEncode(bytes.map((b) => b & 0xff).toList());
   });
-  runtime.registerHostFunction('__ncRandomUuid', (_) {
+  host('__ncRandomUuid', (_) {
     return jsonEncode(cfg.randomUuid?.call() ?? _pseudoUuid());
   });
-  runtime.registerHostFunction('__ncUtf8Encode', (argsJson) {
+  host('__ncUtf8Encode', (argsJson) {
     final text = jsonDecode(argsJson) as String;
-    final bytes = cfg.utf8Encode?.call(text) ?? _latin1Bytes(text);
+    final bytes = cfg.utf8Encode?.call(text) ?? _utf8Bytes(text);
     return jsonEncode(bytes.map((b) => b & 0xff).toList());
   });
-  runtime.registerHostFunction('__ncUtf8Decode', (argsJson) {
+  host('__ncUtf8Decode', (argsJson) {
     final bytes = (jsonDecode(argsJson) as List).cast<int>();
-    return jsonEncode(cfg.utf8Decode?.call(bytes) ?? _latin1String(bytes));
+    return jsonEncode(cfg.utf8Decode?.call(bytes) ?? _utf8String(bytes));
   });
-  runtime.registerHostFunction('__ncBase64Encode', (argsJson) {
+  host('__ncBase64Encode', (argsJson) {
     final text = jsonDecode(argsJson) as String;
     return jsonEncode(cfg.base64Encode?.call(text) ?? _b64Encode(text));
   });
-  runtime.registerHostFunction('__ncBase64Decode', (argsJson) {
+  host('__ncBase64Decode', (argsJson) {
     final text = jsonDecode(argsJson) as String;
     return jsonEncode(cfg.base64Decode?.call(text) ?? _b64Decode(text));
   });
-  runtime.registerHostFunction('__ncExit', (argsJson) {
+  host('__ncExit', (argsJson) {
     cfg.exitHook?.call(jsonDecode(argsJson) as int);
     return null;
   });
   runtime.eval(nodeCompatPrelude, filename: '<node_compat>');
+  runtime.eval(nodeCompatBufferPrelude, filename: '<node_compat_buffer>');
+  runtime.eval(nodeCompatUrlPrelude, filename: '<node_compat_url>');
+  return NodeCompatHandle._(runtime);
 }
 
 /// Registers (or replaces) one consumer-provided builtin module visible
@@ -206,18 +274,19 @@ String _pseudoUuid() {
       '${s.substring(12, 16)}-${s.substring(16, 20)}-${s.substring(20)}';
 }
 
-List<int> _latin1Bytes(String text) =>
-    text.codeUnits.map((c) => c & 0xff).toList(growable: false);
+// True UTF-8 (dart:convert) — the latin-1 approximation is gone: default
+// codecs must match Node byte-for-byte, hooks are for override only.
+List<int> _utf8Bytes(String text) => utf8.encode(text);
 
-String _latin1String(List<int> bytes) =>
-    String.fromCharCodes(bytes.map((b) => b & 0xff));
+String _utf8String(List<int> bytes) =>
+    utf8.decode(bytes, allowMalformed: true);
 
 // Minimal base64 (RFC 4648) for the no-hook default path.
 const String _b64alphabet =
     'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 
 String _b64Encode(String text) {
-  final bytes = _latin1Bytes(text);
+  final bytes = _utf8Bytes(text);
   final out = StringBuffer();
   for (var i = 0; i < bytes.length; i += 3) {
     final b0 = bytes[i];
@@ -245,7 +314,7 @@ String _b64Decode(String text) {
     if (i + 2 < clean.length) out.add(((n[1] & 0x0F) << 4) | (n[2] >> 2));
     if (i + 3 < clean.length) out.add(((n[2] & 0x03) << 6) | n[3]);
   }
-  return _latin1String(out);
+  return _utf8String(out);
 }
 
 /// The compat surface, as one JS bootstrap evaluated by
@@ -262,6 +331,33 @@ const String nodeCompatPrelude = r'''
     function safeStringify(v) {
         try { return JSON.stringify(v); } catch (e) { return String(v); }
     }
+    function inspectValue(v, depth) {
+        if (v === null) return 'null';
+        if (v === undefined) return 'undefined';
+        var t = typeof v;
+        if (t === 'string') return depth ? "'" + v + "'" : v;
+        if (t === 'number' || t === 'boolean' || t === 'bigint') return String(v);
+        if (t === 'function') return '[Function: ' + (v.name || 'anonymous') + ']';
+        if (Array.isArray(v)) {
+            if ((depth || 0) > 2) return '[Array]';
+            return '[ ' + v.map(function (x) { return inspectValue(x, (depth || 0) + 1); }).join(', ') + ' ]';
+        }
+        if (v instanceof Error) return v.name + ': ' + v.message;
+        if (v instanceof Uint8Array) {
+            return 'Uint8Array(' + v.length + ') ' + safeStringify(Array.prototype.slice.call(v, 0, 32));
+        }
+        if (t === 'object') {
+            if ((depth || 0) > 2) return '[Object]';
+            var keys = Object.keys(v);
+            var body = keys.slice(0, 32).map(function (k) {
+                return k + ': ' + inspectValue(v[k], (depth || 0) + 1);
+            });
+            if (keys.length > 32) body.push('...');
+            return '{ ' + body.join(', ') + ' }';
+        }
+        return String(v);
+    }
+
     function unsupported(name, alternative) {
         var fn = function () {
             throw new Error(name + ' is not available in quickjs_runtime: ' +
@@ -271,17 +367,150 @@ const String nodeCompatPrelude = r'''
     }
 
     // ── console ──
-    var consoleObj = {};
-    ['log', 'info', 'warn', 'error', 'debug', 'trace'].forEach(function (level) {
-        consoleObj[level] = function () {
-            var parts = [];
-            for (var i = 0; i < arguments.length; i++) {
-                var a = arguments[i];
-                parts.push(typeof a === 'string' ? a : safeStringify(a));
-            }
-            __ncConsoleWrite(level, parts.join(' '));
-        };
+    function fmtArg(a) {
+        if (typeof a === 'string') return a;
+        return inspectValue(a);
+    }
+    function consoleWrite(level, args) {
+        var parts = [];
+        for (var i = 0; i < args.length; i++) parts.push(fmtArg(args[i]));
+        __ncConsoleWrite(level, __ncIndent + parts.join(' '));
+    }
+    var timers = {};
+    var counters = {};
+    var groupDepth = 0;
+    Object.defineProperty(globalThis, '__ncIndent', {
+        get: function () { return '  '.repeat(groupDepth); },
+        configurable: true
     });
+    var consoleObj = {};
+    ['log', 'info', 'warn', 'error', 'debug'].forEach(function (level) {
+        consoleObj[level] = function () { consoleWrite(level, arguments); };
+    });
+    consoleObj.trace = function () {
+        var args = ['Trace'];
+        for (var i = 0; i < arguments.length; i++) args.push(arguments[i]);
+        consoleWrite('error', args);
+    };
+    consoleObj.dir = function (obj) {
+        __ncConsoleWrite('log', __ncIndent + inspectValue(obj));
+    };
+    consoleObj.time = function (label) {
+        timers[label === undefined ? 'default' : String(label)] = __ncNow();
+    };
+    consoleObj.timeLog = function (label) {
+        var key = label === undefined ? 'default' : String(label);
+        var start = timers[key];
+        if (start === undefined) {
+            consoleWrite('warn', ['Timer \'' + key + '\' does not exist']);
+            return;
+        }
+        var rest = [];
+        for (var i = 1; i < arguments.length; i++) rest.push(arguments[i]);
+        consoleWrite('log', [key + ': ' + (__ncNow() - start) + 'ms'].concat(rest));
+    };
+    consoleObj.timeEnd = function (label) {
+        var key = label === undefined ? 'default' : String(label);
+        var start = timers[key];
+        if (start === undefined) {
+            consoleWrite('warn', ['Timer \'' + key + '\' does not exist']);
+            return;
+        }
+        delete timers[key];
+        consoleWrite('log', [key + ': ' + (__ncNow() - start) + 'ms']);
+    };
+    consoleObj.count = function (label) {
+        var key = label === undefined ? 'default' : String(label);
+        counters[key] = (counters[key] || 0) + 1;
+        consoleWrite('log', [key + ': ' + counters[key]]);
+    };
+    consoleObj.countReset = function (label) {
+        var key = label === undefined ? 'default' : String(label);
+        delete counters[key];
+    };
+    consoleObj.group = function () {
+        if (arguments.length) consoleWrite('log', arguments);
+        groupDepth++;
+    };
+    consoleObj.groupCollapsed = consoleObj.group;
+    consoleObj.groupEnd = function () {
+        if (groupDepth > 0) groupDepth--;
+    };
+    consoleObj.table = function (data) {
+        __ncConsoleWrite('log', __ncIndent + renderTable(data));
+    };
+    function padCell(v, width) {
+        var s = String(v);
+        var out = s;
+        for (var i = s.length; i < width; i++) out += ' ';
+        return out;
+    }
+    function renderTable(data) {
+        var rows;
+        var isArr = Array.isArray(data);
+        if (isArr) {
+            rows = data.map(function (v, i) { return [String(i), v]; });
+        } else if (data && typeof data === 'object') {
+            rows = Object.keys(data).map(function (k) { return [k, data[k]]; });
+        } else {
+            return safeStringify(data);
+        }
+        var cols = [];
+        var headerSet = {};
+        rows.forEach(function (r) {
+            var v = r[1];
+            if (v && typeof v === 'object' && !(v instanceof Date)) {
+                Object.keys(v).forEach(function (k) {
+                    if (!headerSet[k]) { headerSet[k] = true; cols.push(k); }
+                });
+            }
+        });
+        var header = isArr ? ['(iteration index)'] : ['(index)'];
+        header = header.concat(cols.length ? cols : ['Values']);
+        var lines = [];
+        var widths = header.map(function (h) { return String(h).length; });
+        var table = rows.map(function (r) {
+            var v = r[1];
+            if (v && typeof v === 'object') {
+                return [r[0]].concat(cols.map(function (c) {
+                    return c in v ? safeStringify(v[c]) : '';
+                }));
+            }
+            return [r[0]].concat(cols.length ? [] : [safeStringify(v)]);
+        });
+        [header].concat(table).forEach(function (row) {
+            row.forEach(function (cell, i) {
+                if (String(cell).length > widths[i]) widths[i] = String(cell).length;
+            });
+        });
+        function renderRow(row) {
+            return '\u2502 ' + row.map(function (c, i) {
+                return padCell(String(c), widths[i]);
+            }).join(' \u2502 ') + ' \u2502';
+        }
+        var sep = '\u250c' + widths.map(function (w) {
+            var d = '';
+            for (var i = 0; i < w + 2; i++) d += '\u2500';
+            return d;
+        }).join('\u252c') + '\u2510';
+        var sepMid = '\u251c' + widths.map(function (w) {
+            var d = '';
+            for (var i = 0; i < w + 2; i++) d += '\u2500';
+            return d;
+        }).join('\u253c') + '\u2524';
+        var sepEnd = '\u2514' + widths.map(function (w) {
+            var d = '';
+            for (var i = 0; i < w + 2; i++) d += '\u2500';
+            return d;
+        }).join('\u2534') + '\u2518';
+        lines.push(sep, renderRow(header), sepMid);
+        table.forEach(function (row, idx) {
+            lines.push(renderRow(row));
+            if (idx < table.length - 1) lines.push(sepMid);
+        });
+        lines.push(sepEnd);
+        return lines.join('\n');
+    }
     globalThis.console = consoleObj;
 
     // ── global ──
@@ -295,21 +524,91 @@ const String nodeCompatPrelude = r'''
     function cwdSafe() {
         try { return __ncCwd(); } catch (e) { return '/'; }
     }
+    var exitListeners = [];
+    var argvList = (cfg.argv && cfg.argv.length) ? cfg.argv.slice()
+        : ['<runtime>', cfg.scriptPath || '<main>'];
+    var clockZero = null;
+    function monoMs() {
+        var now = __ncNow();
+        if (clockZero === null) clockZero = now;
+        return now - clockZero;
+    }
     globalThis.process = {
         env: envObj,
         platform: cfg.platform,
         arch: cfg.arch,
         version: cfg.nodeVersion,
         exitCode: 0,
-        argv: ['quickjs'],
+        pid: cfg.pid || 1,
+        execPath: argvList[0] || '<runtime>',
+        argv: argvList,
+        cwd: cwdSafe,
+        hrtime: function hrtime(previous) {
+            var ms = monoMs();
+            var secs = Math.floor(ms / 1000);
+            var nanos = Math.round((ms - secs * 1000) * 1e6);
+            if (Array.isArray(previous)) {
+                var dSecs = secs - previous[0];
+                var dNanos = nanos - previous[1];
+                if (dNanos < 0) { dSecs -= 1; dNanos += 1e9; }
+                return [dSecs, dNanos];
+            }
+            return [secs, nanos];
+        },
+        uptime: function () { return monoMs() / 1000; },
+        memoryUsage: function () {
+            return { rss: 0, heapTotal: 0, heapUsed: 0, external: 0,
+                arrayBuffers: 0 };
+        },
+        on: function (event, listener) {
+            if (event === 'exit') exitListeners.push(listener);
+            return globalThis.process;
+        },
+        addListener: function (event, listener) {
+            return globalThis.process.on(event, listener);
+        },
+        stdout: {
+            isTTY: false,
+            write: function (s) {
+                __ncConsoleWrite('log', __ncIndent + String(s));
+                return true;
+            }
+        },
+        stderr: {
+            isTTY: false,
+            write: function (s) {
+                __ncConsoleWrite('error', __ncIndent + String(s));
+                return true;
+            }
+        },
+        stdin: { readable: false, on: function () { return this; } },
         cwd: cwdSafe,
         exit: function (code) {
             try { __ncExit(code || 0); } catch (e) { /* host hook only */ }
+            for (var i = 0; i < exitListeners.length; i++) {
+                try { exitListeners[i](code || 0); } catch (e2) { /* stay sync */ }
+            }
             throw new Error('ProcessExit: ' + (code || 0));
         },
         nextTick: unsupported('process.nextTick',
             'no scheduling beyond promises — run the work directly')
     };
+    process.hrtime.bigint = function () {
+        var ms = monoMs();
+        return BigInt(Math.round(ms * 1e6));
+    };
+    globalThis.__ncSetScriptPath = function (p) {
+        argvList[1] = p;
+        var idx = String(p).lastIndexOf('/');
+        globalThis.__filename = p;
+        globalThis.__dirname = idx < 0 ? '.' : (idx === 0 ? '/' : String(p).slice(0, idx));
+    };
+    if (cfg.scriptPath) {
+        globalThis.__ncSetScriptPath(cfg.scriptPath);
+    } else {
+        globalThis.__filename = '[eval]';
+        globalThis.__dirname = cwdSafe();
+    }
 
     // ── performance ──
     globalThis.performance = {
@@ -540,7 +839,7 @@ const String nodeCompatPrelude = r'''
         return out;
     }
     globalThis.util = {
-        inspect: function (v) { return safeStringify(v); },
+        inspect: function (v) { return inspectValue(v, 0); },
         format: format,
         types: {
             isPromise: function (v) { return v instanceof Promise; }
@@ -553,7 +852,10 @@ const String nodeCompatPrelude = r'''
     var builtins = {
         path: function () { return path; },
         assert: function () { return assert; },
-        util: function () { return globalThis.util; }
+        util: function () { return globalThis.util; },
+        os: function () { return osModule; },
+        url: function () { return globalThis.__ncRegistry.url(); },
+        buffer: function () { return globalThis.__ncRegistry.buffer(); }
     };
     var baseRequire = typeof require === 'function' ? require : null;
     function compatRequire(name) {
@@ -565,16 +867,83 @@ const String nodeCompatPrelude = r'''
         }
         if (baseRequire) return baseRequire(name);
         throw new Error("Cannot find module '" + name +
-            "' (compat builtins: path, assert, util" +
+            "' (compat builtins: path, assert, util, os, url, buffer" +
             (Object.keys(registry).length
                 ? '; consumer-registered: ' + Object.keys(registry).join(', ')
                 : '') + ')');
     }
     globalThis.require = compatRequire;
 
+    // ── Intl (typeof-safe, call-time stubs — no ICU in QuickJS) ──
+    function intlStub(name) {
+        return function () {
+            throw new Error(
+                'Intl.' + name + ' is not available in quickjs_runtime: ' +
+                'no ICU in QuickJS — format in the host or with plain JS');
+        };
+    }
+    globalThis.Intl = {
+        NumberFormat: intlStub('NumberFormat'),
+        DateTimeFormat: intlStub('DateTimeFormat'),
+        Collator: intlStub('Collator'),
+        PluralRules: intlStub('PluralRules'),
+        RelativeTimeFormat: intlStub('RelativeTimeFormat'),
+        ListFormat: intlStub('ListFormat'),
+        Segmenter: intlStub('Segmenter'),
+        DisplayNames: intlStub('DisplayNames'),
+        SupportedLocales: function () { return []; },
+        getCanonicalLocales: function (locales) {
+            if (locales === undefined || locales === null) return [];
+            return Array.isArray(locales) ? locales.slice()
+                : [String(locales)];
+        }
+    };
+
+    // ── os builtin module (require('os'); no global, like Node) ──
+    var osModule = {
+        EOL: cfg.platform === 'win32' ? '\r\n' : '\n',
+        arch: function () { return cfg.arch; },
+        platform: function () { return cfg.platform; },
+        type: function () {
+            if (cfg.platform === 'win32') return 'Windows_NT';
+            if (cfg.platform === 'darwin') return 'Darwin';
+            return 'Linux';
+        },
+        release: function () { return ''; },
+        hostname: function () { return cfg.hostname || 'localhost'; },
+        tmpdir: function () {
+            if (cfg.tmpdir) return cfg.tmpdir;
+            if (cfg.platform === 'win32') {
+                return envObj.TEMP || envObj.TMP || 'C:\\Windows\\Temp';
+            }
+            return '/tmp';
+        },
+        homedir: function () {
+            if (cfg.homedir) return cfg.homedir;
+            return envObj.HOME || (cfg.platform === 'win32'
+                ? 'C:\\Users\\user' : '/root');
+        },
+        cpus: function () {
+            var n = cfg.cpusCount || 1;
+            var out = [];
+            for (var i = 0; i < n; i++) {
+                out.push({ model: 'QuickJS', speed: 0, times: {
+                    user: 0, nice: 0, sys: 0, idle: 0, irq: 0 } });
+            }
+            return out;
+        },
+        uptime: function () { return Math.floor(monoMs() / 1000); },
+        loadavg: function () { return [0, 0, 0]; },
+        totalmem: function () { return 0; },
+        freemem: function () { return 0; },
+        networkInterfaces: function () { return {}; },
+        userInfo: function () {
+            return { username: 'user', uid: -1, gid: -1, shell: null,
+                homedir: osModule.homedir() };
+        }
+    };
+
     // ── Tier 2: call-time stubs (typeof-safe) ──
-    globalThis.Buffer = unsupported('Buffer',
-        'use TextEncoder / TextDecoder for bytes, atob / btoa for base64');
     globalThis.fetch = unsupported('fetch',
         'this runtime is sync-call-style — use the host-provided sync tools ' +
         'or runAsync(fn, args) for parallel engines');

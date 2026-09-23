@@ -60,7 +60,8 @@ void main() {
     test('console routes to the sink with levels', () {
       rt.eval("console.log('hello', 42, {a: 1})");
       rt.eval("console.warn('careful')");
-      expect(logs, ['log: hello 42 {"a":1}', 'warn: careful']);
+      // console now renders via util.inspect (Node style), not JSON
+      expect(logs, ['log: hello 42 { a: 1 }', 'warn: careful']);
     });
 
     test('process exposes env, platform, arch, version, cwd', () {
@@ -130,7 +131,7 @@ void main() {
         evalJson(rt, "util.format('%s=%d %j', 'a', 5, {b: 2})"),
         'a=5 {"b":2}',
       );
-      expect(evalJson(rt, 'util.inspect({k: 1})'), '{"k":1}');
+      expect(evalJson(rt, 'util.inspect({k: 1})'), '{ k: 1 }');
     });
 
     test('atob / btoa roundtrip', () {
@@ -223,12 +224,13 @@ void main() {
     tearDown(() => rt.close());
 
     test('stubs are typeof-safe but throw the alternative on call', () {
-      expect(evalJson(rt, 'typeof Buffer'), 'function');
+      // Buffer graduated from tier-2 stub to a real Uint8Array subclass
+      expect(evalJson(rt, 'typeof Buffer.from'), 'function');
       expect(evalJson(rt, 'typeof fetch'), 'function');
       expect(evalJson(rt, 'typeof setTimeout'), 'function');
 
       for (final expr in [
-        'Buffer(1)',
+        'fetch(1)',
         "fetch('http://x')",
         'new AbortController()',
         'setTimeout(function () {}, 10)',
