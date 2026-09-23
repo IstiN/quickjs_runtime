@@ -1,21 +1,33 @@
-# Unreleased
+# 0.3.1
 
-- **Real timers + `events` + microtask auto-drain.** Promise reactions
-  now drain automatically after every eval (capped; Node/GraalJS
-  parity — `.then`/`queueMicrotask`/`process.nextTick`/`util.promisify`
-  work out of the box; previously reactions never ran). Timers are a
-  real sync-drain scheduler driven by `NodeCompatHandle.drainTimers()`
-  in three modes (`none`/`ready`/`block`) with injectable clock +
-  blocking sleep (`qjs_sleep_ms`), unref'd-timer semantics, a
-  per-pass callback cap and a wall-clock bound. `require('events')`
-  ships a 1:1 synchronous `EventEmitter`. `util.callbackify` joins
-  `promisify` as real. New additive C symbols
-  (`qjs_execute_pending_jobs_capped`, `qjs_sleep_ms`) — older .so
-  builds keep working via guarded lookups.
-- **Sync `fetch`** behind `NodeCompatConfig.httpFetch` (embedding
-  provides the transport): real `fetch`/`Headers`/`Response` —
-  case-insensitive headers, one-shot body accessors, `TypeError:
-  fetch failed` + `cause`, await-compatible plain-value bodies.
+Restores the **sync `fetch`** and **timers / microtask auto-drain /
+`require('events')`** features: their stacked PRs (#7, #8) were merged
+out-of-band and their commits were not part of the `main` tree the
+0.3.0 tarball was published from — the 0.3.0 section below documents
+the intended surface, but only 0.3.1 actually ships it. Internally the
+async surface now lives in its own prelude
+(`node_compat_async.dart`); `require('events')`/`require('os')`
+registration moved from the core builtin map into that prelude. No
+other API or behavior changes.
+
+# 0.3.0
+
+- **Sync `fetch`** (opt-in): `NodeCompatConfig.httpFetch` hook + real
+  `Headers`/`Response` (`text()`/`json()`/`arrayBuffer()`, `bodyUsed`,
+  `ok`/`status`/`headers`); failures surface as
+  `TypeError: fetch failed` with `cause`. Bodies are plain values, so
+  `await res.text()` works through them; `AbortSignal` is not
+  supported (documented deviation). Without the hook, `fetch` stays a
+  self-documenting stub — the runtime remains I/O-clean.
+- **Real timers + microtask auto-drain + events**: promise reactions,
+  `queueMicrotask` and `process.nextTick` now actually run — the
+  QuickJS pending-job queue is drained (capped) after every successful
+  eval. `setTimeout`/`setInterval`/`setImmediate` + `clear*` are real,
+  host-driven callbacks via `NodeCompatHandle.drainTimers()` in
+  `ready` (default, UI-safe) / `block` (sleeps until the nearest
+  reffed timer — CLI "setTimeout as sleep") / `none` modes, with
+  `unref()`, a callback-count guard and a wall-clock budget.
+  `require('events')` provides the full synchronous `EventEmitter`.
 - **Node parity pack** (issue #3 follow-up): real `Buffer` (Uint8Array
   subclass, Node encodings + LE/BE accessors), `URL`/`URLSearchParams`
   (WHATWG subset verified against real Node), `console.time`/`table`/
@@ -36,9 +48,9 @@
     `crypto.randomUUID()`/`getRandomValues()`, `structuredClone`
     (JSON fidelity), `require()` builtin registry + consumer modules
     (`installNodeCompatModule`) + fallback to a pre-existing loader.
-  - **Tier 2 — self-documenting stubs:** `Buffer`, `fetch`,
-    `AbortController`, `setTimeout`/`setInterval`/`setImmediate`,
-    `process.nextTick` — `typeof`-safe, throw the alternative on call.
+  - **Tier 2 — self-documenting stub:** `AbortController` —
+    `typeof`-safe, throws the alternative on call (fetch has no signal
+    support yet).
   - Host hooks: env, cwd, clock, secure random, utf-8/base64 codecs,
     console sink, exit notification. Without hooks, safe defaults.
 

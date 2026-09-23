@@ -17,6 +17,10 @@ is all you need.
 tool/build_quickjs.sh   # produces native/quickjs/libquickjs_bridge.so (gcc)
 ```
 
+A fresh checkout (including a pub-cache download) has **no** `.so` — run
+the build once after `pub add`. pub packages cannot ship binaries, so
+consumers wire this into their own build (Makefile / CI step).
+
 The library is looked up via the `JSR_QUICKJS_LIB` env var, inside this
 package's checkout, or in `<cwd>/native/quickjs/` — in that order.
 

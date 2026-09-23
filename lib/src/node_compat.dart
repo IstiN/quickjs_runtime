@@ -44,10 +44,13 @@ library;
 
 import 'dart:convert';
 
+import 'node_compat_async.dart';
 import 'node_compat_buffer.dart';
 import 'node_compat_fetch.dart';
 import 'node_compat_url.dart';
 import 'quickjs_runtime.dart';
+
+part 'node_compat_fallbacks.dart';
 
 /// Consumer hooks and values for [installNodeCompat].
 class NodeCompatConfig {
@@ -251,86 +254,92 @@ class NodeCompatHandle {
     final limit = deadline ?? _cfg.maxTimerDrainWallClock;
     var ran = 0;
     while (true) {
-      final errMsg = <String?>[null];
-      // eval JSON-encodes the returned object; jsonDecode gives the status
-      // map directly (no JS-side stringify — that would double-encode).
-      final raw = _runtime.eval(
-        'globalThis.__ncTimerDrain()',
-        filename: '<node_compat_timer_drain>',
-        errMsg: errMsg,
-      );
-      if (raw == null) {
-        throw StateError(
-            'node_compat timer drain failed: ${errMsg[0] ?? "unknown"}');
-      }
-      final st = jsonDecode(raw) as Map<String, dynamic>;
-      if (st['capped'] == true) {
-        throw StateError('node_compat timer drain exceeded maxTimerCallbacks '
-            '(${_cfg.maxTimerCallbacks}) — possible setInterval(fn, 0) storm');
-      }
+      final st = _drainPass();
       ran += (st['ran'] as num).toInt();
       // promise reactions queued by callbacks run before the next pass
       _runtime.drainMicrotasks();
 
       final nextDue = st['nextDue'];
       if (_cfg.timerDrain != TimerDrainMode.block || nextDue == null) {
-        final pending = _runtime.eval(
-          'globalThis.__ncTimerPendingCount()',
-          filename: '<node_compat_timer_drain>',
-        );
-        return TimerDrainStats(
-          ran: ran,
-          pending: pending == null ? 0 : int.parse(pending),
-        );
+        return _finishPass(ran);
       }
-      final waitMs = (nextDue as num).toDouble() - _nowMs();
-      if (waitMs <= 0) continue;
-      if (wall.elapsed >= limit) {
-        throw StateError(
-            'node_compat timer drain exceeded maxTimerDrainWallClock '
-            '(${_cfg.maxTimerDrainWallClock}) with '
-            '${_runtime.eval('globalThis.__ncTimerPendingCount()')} timers '
-            'still pending — an interval that never ends?');
-      }
-      final remaining = limit - wall.elapsed;
-      var sleepFor = waitMs;
-      if (Duration(milliseconds: sleepFor.round()) > remaining) {
-        sleepFor = remaining.inMilliseconds.toDouble();
-      }
-      if (sleepFor > 0) {
-        _sleep(Duration(milliseconds: sleepFor.round()));
-      }
+      if (_waitForNextDue(nextDue, wall, limit)) continue;
     }
+  }
+
+  static const _timerDrainFile = '<node_compat_timer_drain>';
+
+  /// Runs one drain pass; raises on eval failure or the storm guard.
+  Map<String, dynamic> _drainPass() {
+    final errMsg = <String?>[null];
+    // jsonDecode (not JS stringify — that would double-encode).
+    final raw = _runtime.eval(
+      'globalThis.__ncTimerDrain()',
+      filename: _timerDrainFile,
+      errMsg: errMsg,
+    );
+    if (raw == null) {
+      throw StateError(
+          'node_compat timer drain failed: ${errMsg[0] ?? "unknown"}');
+    }
+    final st = jsonDecode(raw) as Map<String, dynamic>;
+    if (st['capped'] == true) {
+      throw StateError('node_compat timer drain exceeded maxTimerCallbacks '
+          '(${_cfg.maxTimerCallbacks}) — possible setInterval(fn, 0) storm');
+    }
+    return st;
+  }
+
+  /// Pending-timer count after a pass, as the drain result.
+  TimerDrainStats _finishPass(int ran) {
+    final pending = _runtime.eval(
+      'globalThis.__ncTimerPendingCount()',
+      filename: _timerDrainFile,
+    );
+    return TimerDrainStats(
+      ran: ran,
+      pending: pending == null ? 0 : int.parse(pending),
+    );
+  }
+
+  /// Returns `true` when the earliest timer is already due (drain again
+  /// now); otherwise sleeps for clamp(wait, remaining wall clock) —
+  /// raising when the wall-clock budget is exhausted with timers left.
+  bool _waitForNextDue(Object? nextDue, Stopwatch wall, Duration limit) {
+    final waitMs = (nextDue as num).toDouble() - _nowMs();
+    if (waitMs <= 0) return true;
+    if (wall.elapsed >= limit) {
+      final pending = _runtime.eval(
+        'globalThis.__ncTimerPendingCount()',
+        filename: _timerDrainFile,
+      );
+      throw StateError(
+          'node_compat timer drain exceeded maxTimerDrainWallClock '
+          '($limit) with $pending timers still pending — '
+          'an interval that never ends?');
+    }
+    final remaining = limit - wall.elapsed;
+    var sleepFor = waitMs;
+    if (Duration(milliseconds: sleepFor.round()) > remaining) {
+      sleepFor = remaining.inMilliseconds.toDouble();
+    }
+    if (sleepFor > 0) {
+      _sleep(Duration(milliseconds: sleepFor.round()));
+    }
+    return false;
   }
 }
 
 /// Installs the compat layer onto [runtime]. Idempotent per runtime
 /// (reinstalling replaces the previous surface).
-NodeCompatHandle installNodeCompat(
-  QuickjsRuntime runtime, [
-  NodeCompatConfig? config,
-]) {
-  final cfg = config ?? const NodeCompatConfig();
-  void host(String name, String? Function(String argsJson) fn) {
-    // registerHostFunction keeps its own alive list; we mirror it so
-    // NodeCompatHandle.dispose can release them deterministically.
-    runtime.registerHostFunction(name, fn);
-  }
-
-  runtime.setGlobal('__ncConfig', {
-    'env': cfg.env,
-    'platform': cfg.platform,
-    'arch': cfg.arch,
-    'nodeVersion': cfg.nodeVersion,
-    'argv': cfg.argv,
-    'scriptPath': cfg.scriptPath,
-    'pid': cfg.pid?.call() ?? 1,
-    'cpusCount': cfg.cpusCount?.call() ?? 1,
-    'hostname': cfg.hostname?.call() ?? 'localhost',
-    'tmpdir': cfg.tmpdir?.call(),
-    'homedir': cfg.homedir?.call(),
-  });
-  runtime.setGlobal('__ncMaxTimerCallbacks', cfg.maxTimerCallbacks);
+/// Registers the JSON host hooks the compat prelude calls into
+/// (`__ncCwd`, `__ncNow`, console sink, crypto/utf-8/base64 codecs, exit).
+/// Each hook consults [cfg] first and falls back to the pure-Dart default.
+void _registerCompatHosts(
+  QuickjsRuntime runtime,
+  NodeCompatConfig cfg,
+  void Function(String name, String? Function(String argsJson) fn) host,
+) {
   host('__ncCwd', (_) => jsonEncode(cfg.cwd?.call() ?? '/'));
   host('__ncNow', (_) {
     final ms =
@@ -380,7 +389,39 @@ NodeCompatHandle installNodeCompat(
       return cfg.httpFetch!(argsJson);
     });
   }
+}
+
+/// Installs the compat layer onto [runtime]. Idempotent per runtime
+/// (reinstalling replaces the previous surface).
+NodeCompatHandle installNodeCompat(
+  QuickjsRuntime runtime, [
+  NodeCompatConfig? config,
+]) {
+  final cfg = config ?? const NodeCompatConfig();
+  void host(String name, String? Function(String argsJson) fn) {
+    // registerHostFunction keeps its own alive list; we mirror it so
+    // NodeCompatHandle.dispose can release them deterministically.
+    runtime.registerHostFunction(name, fn);
+  }
+
+  runtime.setGlobal('__ncConfig', {
+    'env': cfg.env,
+    'platform': cfg.platform,
+    'arch': cfg.arch,
+    'nodeVersion': cfg.nodeVersion,
+    'argv': cfg.argv,
+    'scriptPath': cfg.scriptPath,
+    'pid': cfg.pid?.call() ?? 1,
+    'cpusCount': cfg.cpusCount?.call() ?? 1,
+    'hostname': cfg.hostname?.call() ?? 'localhost',
+    'tmpdir': cfg.tmpdir?.call(),
+    'homedir': cfg.homedir?.call(),
+  });
+  _registerCompatHosts(runtime, cfg, host);
+
+  runtime.setGlobal('__ncMaxTimerCallbacks', cfg.maxTimerCallbacks);
   runtime.eval(nodeCompatPrelude, filename: '<node_compat>');
+  runtime.eval(nodeCompatAsyncPrelude, filename: '<node_compat_async>');
   runtime.eval(nodeCompatBufferPrelude, filename: '<node_compat_buffer>');
   runtime.eval(nodeCompatUrlPrelude, filename: '<node_compat_url>');
   if (cfg.httpFetch != null) {
@@ -411,70 +452,6 @@ void installNodeCompatModule(
 }
 
 String _safeName(String name) => name.replaceAll(RegExp(r'[^A-Za-z0-9_]'), '_');
-
-// ── Default (non-secure / approximating) fallbacks ──
-
-int _pseudoState = 0x2545F491;
-
-List<int> _pseudoRandom(int count) => List<int>.generate(
-      count,
-      (_) =>
-          (_pseudoState = (_pseudoState * 1103515245 + 12345) & 0x7FFFFFFF) &
-          0xFF,
-      growable: false,
-    );
-
-String _pseudoUuid() {
-  final bytes = _pseudoRandom(16);
-  bytes[6] = (bytes[6] & 0x0F) | 0x40;
-  bytes[8] = (bytes[8] & 0x3F) | 0x80;
-  String hex(int b) => b.toRadixString(16).padLeft(2, '0');
-  final s = bytes.map(hex).join();
-  return '${s.substring(0, 8)}-${s.substring(8, 12)}-'
-      '${s.substring(12, 16)}-${s.substring(16, 20)}-${s.substring(20)}';
-}
-
-// True UTF-8 (dart:convert) — the latin-1 approximation is gone: default
-// codecs must match Node byte-for-byte, hooks are for override only.
-List<int> _utf8Bytes(String text) => utf8.encode(text);
-
-String _utf8String(List<int> bytes) => utf8.decode(bytes, allowMalformed: true);
-
-// Minimal base64 (RFC 4648) for the no-hook default path.
-const String _b64alphabet =
-    'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-
-String _b64Encode(String text) {
-  final bytes = _utf8Bytes(text);
-  final out = StringBuffer();
-  for (var i = 0; i < bytes.length; i += 3) {
-    final b0 = bytes[i];
-    final b1 = i + 1 < bytes.length ? bytes[i + 1] : null;
-    final b2 = i + 2 < bytes.length ? bytes[i + 2] : null;
-    out.write(_b64alphabet[b0 >> 2]);
-    out.write(_b64alphabet[((b0 & 0x03) << 4) | ((b1 ?? 0) >> 4)]);
-    out.write(
-      b1 == null ? '=' : _b64alphabet[((b1 & 0x0F) << 2) | ((b2 ?? 0) >> 6)],
-    );
-    out.write(b2 == null ? '=' : _b64alphabet[b2 & 0x3F]);
-  }
-  return out.toString();
-}
-
-String _b64Decode(String text) {
-  final clean = text.replaceAll('=', '').replaceAll(RegExp(r'\s'), '');
-  final out = <int>[];
-  for (var i = 0; i < clean.length; i += 4) {
-    final n = [0, 1, 2, 3]
-        .map((k) =>
-            i + k < clean.length ? _b64alphabet.indexOf(clean[i + k]) : 0)
-        .toList();
-    out.add((n[0] << 2) | (n[1] >> 4));
-    if (i + 2 < clean.length) out.add(((n[1] & 0x0F) << 4) | (n[2] >> 2));
-    if (i + 3 < clean.length) out.add(((n[2] & 0x03) << 6) | n[3]);
-  }
-  return _utf8String(out);
-}
 
 /// The compat surface, as one JS bootstrap evaluated by
 /// [installNodeCompat].
@@ -517,6 +494,7 @@ const String nodeCompatPrelude = r'''
         return String(v);
     }
 
+    globalThis.__ncUnsupported = unsupported;
     function unsupported(name, alternative) {
         var fn = function () {
             throw new Error(name + ' is not available in quickjs_runtime: ' +
@@ -1071,11 +1049,11 @@ const String nodeCompatPrelude = r'''
         path: function () { return path; },
         assert: function () { return assert; },
         util: function () { return globalThis.util; },
-        os: function () { return osModule; },
         url: function () { return globalThis.__ncRegistry.url(); },
-        buffer: function () { return globalThis.__ncRegistry.buffer(); },
-        events: function () { return eventsModule; }
+        buffer: function () { return globalThis.__ncRegistry.buffer(); }
     };
+    // The async prelude (events/os/timers) augments this same map after eval.
+    globalThis.__ncBuiltins = builtins;
     var baseRequire = typeof require === 'function' ? require : null;
     function compatRequire(name) {
         if (Object.prototype.hasOwnProperty.call(registry, name)) {
@@ -1118,373 +1096,5 @@ const String nodeCompatPrelude = r'''
         }
     };
 
-    // ── events builtin module (require('events'); no global, like Node) ──
-    // Node's EventEmitter is fully synchronous — emit() calls listeners
-    // inline — so this is 1:1 with Node without any event loop.
-    function EventEmitter() {
-        this._ncEvents = {};
-        this._ncMax = EventEmitter.defaultMaxListeners;
-    }
-    EventEmitter.defaultMaxListeners = 10;
-    EventEmitter.EventEmitter = EventEmitter;
-    EventEmitter.listenerCount = function (emitter, type) {
-        return typeof emitter.listenerCount === 'function'
-            ? emitter.listenerCount(type)
-            : 0;
-    };
-    function eeWrap(emitter, type, listener, prepend) {
-        if (typeof listener !== 'function') {
-            throw new TypeError('listener must be a function');
-        }
-        var list = emitter._ncEvents[type] ||
-            (emitter._ncEvents[type] = []);
-        var entry = { listener: listener, wrapped: null, once: false };
-        // 'newListener' fires before adding (Node semantics)
-        if (type !== 'newListener' && type !== 'removeListener' &&
-            emitter._ncEvents.newListener && emitter._ncEvents.newListener.length) {
-            emitter.emit('newListener', type, listener);
-        }
-        if (prepend === true) {
-            list.unshift(entry);
-        } else {
-            list.push(entry);
-        }
-        if (list.length > emitter._ncMax && emitter._ncMax > 0) {
-            console.warn('MaxListenersExceededWarning: ' + list.length +
-                ' ' + type + ' listeners added to an EventEmitter');
-        }
-        return emitter;
-    }
-    EventEmitter.prototype.setMaxListeners = function (n) {
-        if (typeof n !== 'number' || n < 0 || n !== n /* NaN */) {
-            throw new RangeError(
-                'setMaxListeners: value must be a non-negative number');
-        }
-        this._ncMax = n;
-        return this;
-    };
-    EventEmitter.prototype.getMaxListeners = function () {
-        return this._ncMax;
-    };
-    EventEmitter.prototype.on = function (type, listener) {
-        return eeWrap(this, type, listener, false);
-    };
-    EventEmitter.prototype.addListener = EventEmitter.prototype.on;
-    EventEmitter.prototype.prependListener = function (type, listener) {
-        return eeWrap(this, type, listener, true);
-    };
-    EventEmitter.prototype.once = function (type, listener) {
-        if (typeof listener !== 'function') {
-            throw new TypeError('listener must be a function');
-        }
-        var self = this;
-        function wrapped() {
-            self.off(type, listener);
-            wrapped._ncFired = true;
-            listener.apply(this, arguments);
-        }
-        wrapped._ncOriginal = listener;
-        var list = self._ncEvents[type] || (self._ncEvents[type] = []);
-        var entry = { listener: listener, wrapped: wrapped, once: true };
-        if (type !== 'newListener' && type !== 'removeListener' &&
-            self._ncEvents.newListener) {
-            self.emit('newListener', type, listener);
-        }
-        list.push(entry);
-        if (list.length > self._ncMax && self._ncMax > 0) {
-            console.warn('MaxListenersExceededWarning: ' + list.length +
-                ' ' + type + ' listeners added to an EventEmitter');
-        }
-        return self;
-    };
-    EventEmitter.prototype.prependOnceListener = function (type, listener) {
-        if (typeof listener !== 'function') {
-            throw new TypeError('listener must be a function');
-        }
-        var self = this;
-        function wrapped() {
-            self.off(type, listener);
-            listener.apply(this, arguments);
-        }
-        wrapped._ncOriginal = listener;
-        var list = self._ncEvents[type] || (self._ncEvents[type] = []);
-        list.unshift({ listener: listener, wrapped: wrapped, once: true });
-        return self;
-    };
-    EventEmitter.prototype.off = function (type, listener) {
-        var list = this._ncEvents[type];
-        if (!list) return this;
-        for (var i = 0; i < list.length; i++) {
-            var entry = list[i];
-            if (entry.listener === listener ||
-                (entry.wrapped && entry.wrapped._ncOriginal === listener)) {
-                list.splice(i, 1);
-                if (this._ncEvents.removeListener) {
-                    this.emit('removeListener', type, listener);
-                }
-                return this;
-            }
-        }
-        return this;
-    };
-    EventEmitter.prototype.removeListener = EventEmitter.prototype.off;
-    EventEmitter.prototype.removeAllListeners = function (type) {
-        if (type === undefined) {
-            this._ncEvents = {};
-        } else {
-            delete this._ncEvents[type];
-        }
-        return this;
-    };
-    EventEmitter.prototype.emit = function (type) {
-        var args = Array.prototype.slice.call(arguments, 1);
-        var list = this._ncEvents[type];
-        var hadListener = !!(list && list.length);
-        if (type === 'error' && !hadListener) {
-            var err = args[0];
-            if (err instanceof Error) throw err;
-            var wrapErr = new Error('Unhandled error. (' + err + ')');
-            wrapErr.context = err;
-            throw wrapErr;
-        }
-        if (!hadListener) return false;
-        var calls = list.slice();
-        for (var i = 0; i < calls.length; i++) {
-            var entry = calls[i];
-            var fn = entry.wrapped || entry.listener;
-            if (entry.wrapped) {
-                // run once-wrapper then drop it (Node order: off before run)
-                var idx = list.indexOf(entry);
-                if (idx >= 0) list.splice(idx, 1);
-            }
-            fn.apply(this, args);
-        }
-        return true;
-    };
-    EventEmitter.prototype.listeners = function (type) {
-        var list = this._ncEvents[type] || [];
-        return list.map(function (e) { return e.listener; });
-    };
-    EventEmitter.prototype.rawListeners = function (type) {
-        var list = this._ncEvents[type] || [];
-        return list.map(function (e) { return e.wrapped || e.listener; });
-    };
-    EventEmitter.prototype.listenerCount = function (type) {
-        return (this._ncEvents[type] || []).length;
-    };
-    EventEmitter.prototype.eventNames = function () {
-        return Object.keys(this._ncEvents).filter(function (k) {
-            return this._ncEvents[k].length > 0;
-        }, this);
-    };
-    var eventsModule = EventEmitter;
-
-    // ── os builtin module (require('os'); no global, like Node) ──
-    var osModule = {
-        EOL: cfg.platform === 'win32' ? '\r\n' : '\n',
-        arch: function () { return cfg.arch; },
-        platform: function () { return cfg.platform; },
-        type: function () {
-            if (cfg.platform === 'win32') return 'Windows_NT';
-            if (cfg.platform === 'darwin') return 'Darwin';
-            return 'Linux';
-        },
-        release: function () { return ''; },
-        hostname: function () { return cfg.hostname || 'localhost'; },
-        tmpdir: function () {
-            if (cfg.tmpdir) return cfg.tmpdir;
-            if (cfg.platform === 'win32') {
-                return envObj.TEMP || envObj.TMP || 'C:\\Windows\\Temp';
-            }
-            return '/tmp';
-        },
-        homedir: function () {
-            if (cfg.homedir) return cfg.homedir;
-            return envObj.HOME || (cfg.platform === 'win32'
-                ? 'C:\\Users\\user' : '/root');
-        },
-        cpus: function () {
-            var n = cfg.cpusCount || 1;
-            var out = [];
-            for (var i = 0; i < n; i++) {
-                out.push({ model: 'QuickJS', speed: 0, times: {
-                    user: 0, nice: 0, sys: 0, idle: 0, irq: 0 } });
-            }
-            return out;
-        },
-        uptime: function () { return Math.floor(monoMs() / 1000); },
-        loadavg: function () { return [0, 0, 0]; },
-        totalmem: function () { return 0; },
-        freemem: function () { return 0; },
-        networkInterfaces: function () { return {}; },
-        userInfo: function () {
-            return { username: 'user', uid: -1, gid: -1, shell: null,
-                homedir: osModule.homedir() };
-        }
-    };
-
-    // ── Tier 2: call-time stubs (typeof-safe) ──
-    globalThis.fetch = unsupported('fetch',
-        'this runtime is sync-call-style — use the host-provided sync tools ' +
-        'or runAsync(fn, args) for parallel engines');
-    globalThis.AbortController = unsupported('AbortController',
-        'no async operations in this runtime — nothing to abort');
-
-    // ── timers: real, sync-drain scheduler ──
-    // There is no background event loop: the host drives __ncTimerDrain()
-    // through NodeCompatHandle.drainTimers() at its chosen checkpoints and
-    // (in 'block' mode) sleeps between passes. Ordering matches Node for the
-    // common cases: sync code always runs before any timer, immediates run
-    // before due timeouts, earliest due first.
-    var __timerSeq = 1;
-    var __pendingTimers = {};
-    var __immediates = [];
-    function __timerHandle(id) {
-        return {
-            _ncId: id,
-            unref: function () {
-                var t = __pendingTimers[id];
-                if (t) t.unref = true;
-                return this;
-            },
-            ref: function () {
-                var t = __pendingTimers[id];
-                if (t) t.unref = false;
-                return this;
-            },
-            hasRef: function () {
-                var t = __pendingTimers[id];
-                return !!(t && !t.unref);
-            },
-            refresh: function () {
-                var t = __pendingTimers[id];
-                if (t) t.due = __ncNow() + t.ms;
-                return this;
-            }
-        };
-    }
-    function __immediateHandle(entry) {
-        return {
-            _ncImmEntry: entry,
-            unref: function () { return this; },
-            ref: function () { return this; },
-            hasRef: function () { return true; }
-        };
-    }
-    function __addTimer(fn, ms, args, repeat) {
-        if (typeof fn !== 'function') {
-            throw new TypeError('timer callback must be a function');
-        }
-        var delay = Math.max(0, Number(ms) || 0);
-        var id = __timerSeq++;
-        __pendingTimers[id] = {
-            fn: fn, ms: repeat ? delay : 0, args: args,
-            due: __ncNow() + delay, repeat: !!repeat, unref: false
-        };
-        return __timerHandle(id);
-    }
-    globalThis.setTimeout = function (fn, ms) {
-        return __addTimer(fn, ms, Array.prototype.slice.call(arguments, 2),
-            false);
-    };
-    globalThis.setInterval = function (fn, ms) {
-        return __addTimer(fn, ms, Array.prototype.slice.call(arguments, 2),
-            true);
-    };
-    globalThis.setImmediate = function (fn) {
-        if (typeof fn !== 'function') {
-            throw new TypeError('timer callback must be a function');
-        }
-        var entry = {
-            fn: fn,
-            args: Array.prototype.slice.call(arguments, 1),
-            cancelled: false
-        };
-        __immediates.push(entry);
-        return __immediateHandle(entry);
-    };
-    function __clear(handle) {
-        if (!handle) return;
-        if (handle._ncImmEntry !== undefined) {
-            handle._ncImmEntry.cancelled = true;
-            return;
-        }
-        if (handle._ncId !== undefined) {
-            delete __pendingTimers[handle._ncId];
-        }
-    }
-    globalThis.clearTimeout = __clear;
-    globalThis.clearInterval = __clear;
-    globalThis.clearImmediate = __clear;
-    // Drains everything due right now. The host calls this via
-    // NodeCompatHandle.drainTimers(); it returns a status object the host
-    // uses to decide whether (and how long) to sleep before the next pass.
-    globalThis.__ncTimerDrain = function () {
-        var ran = 0, now, best, id, t, i, im;
-        // immediates first (setImmediate ≈ Node's check phase); consumed
-        // slots are nulled in place so a capped mid-pass return never
-        // re-runs them on the next pass
-        for (i = 0; i < __immediates.length; i++) {
-            if (ran >= __ncMaxTimerCallbacks) {
-                return { ran: ran, capped: true, nextDue: null };
-            }
-            im = __immediates[i];
-            if (im && !im.cancelled) {
-                im.fn.apply(null, im.args);
-                ran++;
-                __immediates[i] = null;
-            }
-        }
-        __immediates = __immediates.filter(function (x) { return x; });
-        // due timeouts/intervals, earliest first
-        for (;;) {
-            if (ran >= __ncMaxTimerCallbacks) {
-                return { ran: ran, capped: true, nextDue: null };
-            }
-            now = __ncNow();
-            best = null;
-            for (id in __pendingTimers) {
-                t = __pendingTimers[id];
-                if (t.due > now) continue;
-                if (best === null || t.due < __pendingTimers[best].due) {
-                    best = id;
-                }
-            }
-            if (best === null) break;
-            t = __pendingTimers[best];
-            if (t.repeat) {
-                t.due = now + t.ms;
-            } else {
-                delete __pendingTimers[best];
-            }
-            t.fn.apply(null, t.args);
-            ran++;
-        }
-        // earliest ref'd future timer (unref'd ones must not hold the host)
-        var nextDue = null;
-        for (id in __pendingTimers) {
-            t = __pendingTimers[id];
-            if (t.unref) continue;
-            if (nextDue === null || t.due < nextDue) nextDue = t.due;
-        }
-        return { ran: ran, capped: false, nextDue: nextDue };
-    };
-    globalThis.__ncTimerPendingCount = function () {
-        var n = 0, id, i;
-        for (id in __pendingTimers) n++;
-        for (i = 0; i < __immediates.length; i++) {
-            if (__immediates[i] && !__immediates[i].cancelled) n++;
-        }
-        return n;
-    };
-
-    // queueMicrotask: real, on the native promise queue (drained by the
-    // runtime after each eval).
-    globalThis.queueMicrotask = function (fn) {
-        if (typeof fn !== 'function') {
-            throw new TypeError('queueMicrotask callback must be a function');
-        }
-        Promise.resolve().then(fn);
-    };
 })();
 ''';

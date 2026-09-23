@@ -205,6 +205,23 @@ typedef AsyncWorkerMain = Future<void> Function(AsyncWorkerLink link);
 /// Lifecycle state of one worker (main-side view).
 enum _WorkerState { booting, idle, busy, dead }
 
+/// Parsed `runAsync(fn, args)` host-call arguments.
+/// The worker-shutdown control message on the spawn inbox.
+const String _shutdownMessage = 'shutdown';
+
+class _DispatchArgs {
+  const _DispatchArgs({this.fnSource, this.argsJson, this.error});
+
+  /// JS function source; null when validation failed.
+  final String? fnSource;
+
+  /// JSON-encoded args; null when validation failed.
+  final String? argsJson;
+
+  /// Validation message for the `__jsError` sentinel.
+  final String? error;
+}
+
 class _Worker {
   _Worker({
     required this.id,
@@ -390,7 +407,7 @@ class AsyncEnginePool {
   void dispose() {
     for (final worker in _workers) {
       if (worker.state != _WorkerState.dead) {
-        worker.sendPort.send('shutdown');
+        worker.sendPort.send(_shutdownMessage);
       }
     }
     _workers.clear();
@@ -416,22 +433,36 @@ class AsyncEnginePool {
   /// `{'__jsError': …}` sentinel the prelude rethrows.
   String _dispatchHost(String argsJson) {
     try {
-      final args = jsonDecode(argsJson);
-      if (args is! List || args.length < 2 || args[0] is! String) {
-        return jsonEncode({
-          '__jsError': 'runAsync expects (function, args) — '
-              'got ${args is List ? args.length : 'non-array'} arguments',
-        });
-      }
-      final second = args[1];
+      final parsed = _parseDispatchArgs(argsJson);
+      final error = parsed.error;
+      if (error != null) return jsonEncode({'__jsError': error});
       final jobId = dispatch(
-        fnSource: args[0] as String,
-        argsJson: second is String ? second : jsonEncode(second),
+        fnSource: parsed.fnSource!,
+        argsJson: parsed.argsJson!,
       );
       return jsonEncode(jobId);
     } catch (e) {
       return jsonEncode({'__jsError': 'runAsync dispatch failed: $e'});
     }
+  }
+
+  /// Validates the JS-side `runAsync(fn, args)` arguments.
+  ///
+  /// Returns the fn source plus JSON-encoded args, or an `error` message
+  /// shaped like the JS-side TypeError the prelude surfaces.
+  _DispatchArgs _parseDispatchArgs(String argsJson) {
+    final args = jsonDecode(argsJson);
+    if (args is! List || args.length < 2 || args[0] is! String) {
+      return _DispatchArgs(
+        error: 'runAsync expects (function, args) — '
+            'got ${args is List ? args.length : 'non-array'} arguments',
+      );
+    }
+    final second = args[1];
+    return _DispatchArgs(
+      fnSource: args[0] as String,
+      argsJson: second is String ? second : jsonEncode(second),
+    );
   }
 
   /// `__jsrWaitHost` implementation: blocks on the pool until [argsJson]'s
@@ -554,7 +585,7 @@ class AsyncEnginePool {
     AsyncJobExecutor executor,
   ) async {
     await for (final message in inbox) {
-      if (message == 'shutdown') return;
+      if (message == _shutdownMessage) return;
       final request = jsonDecode(message as String) as Map<String, dynamic>;
       final jobId = request['jobId'] as int;
       final jobRequest = AsyncJobRequest(
@@ -599,7 +630,7 @@ class _PoolWorkerLink implements AsyncWorkerLink {
     final iterator = _iterator ??= StreamIterator<dynamic>(_inbox);
     if (!await iterator.moveNext()) return null;
     final message = iterator.current;
-    if (message == 'shutdown') return null;
+    if (message == _shutdownMessage) return null;
     final request = jsonDecode(message as String) as Map<String, dynamic>;
     return AsyncJobRequest(
       jobId: request['jobId'] as int,
