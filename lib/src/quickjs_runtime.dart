@@ -26,9 +26,9 @@ class QuickjsRuntime {
   /// Creates a new runtime with a fresh context and an empty host callback
   /// registry.
   QuickjsRuntime()
-    : _ffi = QuickjsFfi(),
-      _runtime = nullptr,
-      _context = nullptr {
+      : _ffi = QuickjsFfi(),
+        _runtime = nullptr,
+        _context = nullptr {
     _ffi.resetCallbacks();
     _runtime = _ffi.createRuntime();
     _context = _ffi.createContext(_runtime);
@@ -58,20 +58,20 @@ class QuickjsRuntime {
   ) {
     final callable =
         NativeCallable<Pointer<Utf8> Function(Pointer<Utf8>)>.isolateLocal((
-          Pointer<Utf8> argsPtr,
-        ) {
-          try {
-            final argsJson = argsPtr.toDartString();
-            final result = callback(argsJson);
-            if (result == null) return nullptr;
-            return result.toNativeUtf8();
-          } catch (_) {
-            // Pointer-returning NativeCallables cannot declare an
-            // exceptionalReturn; a stray exception would otherwise terminate
-            // the isolate. Surface it to JS as `undefined`.
-            return nullptr;
-          }
-        });
+      Pointer<Utf8> argsPtr,
+    ) {
+      try {
+        final argsJson = argsPtr.toDartString();
+        final result = callback(argsJson);
+        if (result == null) return nullptr;
+        return result.toNativeUtf8();
+      } catch (_) {
+        // Pointer-returning NativeCallables cannot declare an
+        // exceptionalReturn; a stray exception would otherwise terminate
+        // the isolate. Surface it to JS as `undefined`.
+        return nullptr;
+      }
+    });
     _callables.add(callable); // keep alive so it isn't GC'd
     _ffi.registerHostFn(_context, name, callable.nativeFunction);
   }

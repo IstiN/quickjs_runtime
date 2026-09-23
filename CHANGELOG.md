@@ -1,3 +1,19 @@
+# Unreleased
+
+- Node/js compat layer (issue #3), opt-in via `installNodeCompat(rt, cfg)`:
+  - **Tier 1 — real:** `global`, `console.*` (pluggable sink), `process`
+    (env/platform/arch/version/exitCode/cwd/exit), `path` (posix subset),
+    `assert` (node-like subset), `util` (subset), `TextEncoder`/
+    `TextDecoder` (utf-8), `atob`/`btoa`, `performance.now()`,
+    `crypto.randomUUID()`/`getRandomValues()`, `structuredClone`
+    (JSON fidelity), `require()` builtin registry + consumer modules
+    (`installNodeCompatModule`) + fallback to a pre-existing loader.
+  - **Tier 2 — self-documenting stubs:** `Buffer`, `fetch`,
+    `AbortController`, `setTimeout`/`setInterval`/`setImmediate`,
+    `process.nextTick` — `typeof`-safe, throw the alternative on call.
+  - Host hooks: env, cwd, clock, secure random, utf-8/base64 codecs,
+    console sink, exit notification. Without hooks, safe defaults.
+
 # 0.2.0
 
 - `AsyncEnginePool`: pre-spawned engine-worker isolates for parallel

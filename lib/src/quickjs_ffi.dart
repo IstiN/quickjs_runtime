@@ -86,27 +86,24 @@ class QuickjsFfi {
   late final Pointer<Void> Function() _createRuntime;
   late final Pointer<Void> Function(Pointer<Void> runtime) _createContext;
   late final void Function(Pointer<Void> runtime, Pointer<Void> context)
-  _destroy;
+      _destroy;
   late final void Function() _resetCallbacks;
   late final int Function(
     Pointer<Void> context,
     Pointer<Utf8> name,
     Pointer<NativeFunction<_HostCallbackNative>> callback,
-  )
-  _registerHostFn;
+  ) _registerHostFn;
   late final Pointer<Utf8> Function(
     Pointer<Void> context,
     Pointer<Utf8> code,
     Pointer<Utf8> filename,
     Pointer<Pointer<Utf8>> errMsg,
-  )
-  _eval;
+  ) _eval;
   late final int Function(
     Pointer<Void> context,
     Pointer<Utf8> name,
     Pointer<Utf8> json,
-  )
-  _setGlobalJson;
+  ) _setGlobalJson;
   late final int Function(Pointer<Void> context) _executePendingJobs;
 
   /// Loads the shared library and resolves symbols.
@@ -135,35 +132,30 @@ class QuickjsFfi {
 
     _registerHostFn = _lib
         .lookup<
-          NativeFunction<
-            Int32 Function(
-              Pointer<Void>,
-              Pointer<Utf8>,
-              Pointer<NativeFunction<_HostCallbackNative>>,
-            )
-          >
-        >('qjs_register_host_fn')
+            NativeFunction<
+                Int32 Function(
+                  Pointer<Void>,
+                  Pointer<Utf8>,
+                  Pointer<NativeFunction<_HostCallbackNative>>,
+                )>>('qjs_register_host_fn')
         .asFunction();
 
     _eval = _lib
         .lookup<
-          NativeFunction<
-            Pointer<Utf8> Function(
-              Pointer<Void>,
-              Pointer<Utf8>,
-              Pointer<Utf8>,
-              Pointer<Pointer<Utf8>>,
-            )
-          >
-        >('qjs_eval')
+            NativeFunction<
+                Pointer<Utf8> Function(
+                  Pointer<Void>,
+                  Pointer<Utf8>,
+                  Pointer<Utf8>,
+                  Pointer<Pointer<Utf8>>,
+                )>>('qjs_eval')
         .asFunction();
 
     _setGlobalJson = _lib
         .lookup<
-          NativeFunction<
-            Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>)
-          >
-        >('qjs_set_global_json')
+            NativeFunction<
+                Int32 Function(Pointer<Void>, Pointer<Utf8>,
+                    Pointer<Utf8>)>>('qjs_set_global_json')
         .asFunction();
 
     // Added after the bridge was first extracted; older builds (e.g. the
