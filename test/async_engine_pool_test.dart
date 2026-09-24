@@ -45,7 +45,88 @@ Map<String, dynamic> echoExecutor(AsyncJobRequest request) {
   }
 }
 
+/// Warm worker that echoes the dispatch context it received: the
+/// dispatched function reads it as `globalThis.__ctx`.
+Future<void> contextEchoWorkerMain(AsyncWorkerLink link) async {
+  final runtime = QuickjsRuntime();
+  try {
+    while (true) {
+      final request = await link.next();
+      if (request == null) return;
+      runtime.setGlobal('__ctx', request.context);
+      link.complete(
+        AsyncJobEnvelope.fromJson(
+          runAsyncJobOnRuntime(
+            runtime,
+            jobId: request.jobId,
+            fnSource: request.fnSource,
+            argsJson: request.argsJson,
+          ),
+        ),
+      );
+    }
+  } finally {
+    runtime.close();
+  }
+}
+
 void main() {
+  group('per-runtime dispatch context (attachMainRuntime)', () {
+    late AsyncEnginePool pool;
+    late QuickjsRuntime main;
+
+    setUp(() async {
+      pool = AsyncEnginePool(
+        workers: 1,
+        workerMain: contextEchoWorkerMain,
+        dispatchContext: () => {'source': 'pool'},
+      );
+      await pool.boot();
+      main = QuickjsRuntime();
+      pool.attachMainRuntime(
+        main,
+        dispatchContext: () => {'source': 'runtime', 'at': 'dispatch'},
+      );
+    });
+
+    tearDown(() {
+      main.close();
+      pool.dispose();
+    });
+
+    test('runtime-attached provider reaches the worker through runAsync', () {
+      final result = main.eval(
+        "runAsync(function () { return globalThis.__ctx; }, null).wait()",
+      );
+      final ctx = jsonDecode(result!) as Map<String, dynamic>;
+      expect(ctx['source'], 'runtime');
+      expect(ctx['at'], 'dispatch');
+    });
+
+    test('pool-level provider is the default when the runtime has none', () {
+      final other = QuickjsRuntime();
+      pool.attachMainRuntime(other);
+      try {
+        final result = other.eval(
+          "runAsync(function () { return globalThis.__ctx; }, null).wait()",
+        );
+        final ctx = jsonDecode(result!) as Map<String, dynamic>;
+        expect(ctx['source'], 'pool');
+      } finally {
+        other.close();
+      }
+    });
+
+    test('explicit dispatch context still wins over providers', () {
+      final id = pool.dispatch(
+        fnSource: 'function () { return globalThis.__ctx; }',
+        argsJson: 'null',
+        context: {'source': 'explicit'},
+      );
+      expect(pool.wait(id).decodedResult, {'source': 'explicit'});
+    });
+  });
+
   group('executor-style pool', () {
     late AsyncEnginePool pool;
 
