@@ -334,13 +334,24 @@ class AsyncEnginePool {
   /// the `__jsrDispatchHost` / `__jsrWaitHost` host functions and evaluates
   /// [asyncJobPrelude] (the `runAsync` / `AsyncJob` globals).
   ///
-  /// Per-dispatch context is captured through [AsyncDispatchContext] (set
-  /// at construction). When the pool is not booted, `runAsync(...)` throws
-  /// a clear JS error on first use (dispatch sentinel) instead of failing
-  /// the engine wiring.
-  void attachMainRuntime(QuickjsRuntime runtime) {
+  /// Per-dispatch context is captured through [AsyncDispatchContext] —
+  /// set either at construction (pool-wide default) or per main runtime
+  /// via [dispatchContext]. The runtime-attached provider wins when both
+  /// are set: a shared pool serves many main engines whose dispatch
+  /// context differs per engine (script directory, job params, …).
+  ///
+  /// The provider runs synchronously on the submitting isolate inside the
+  /// `runAsync` host call; its return value must be SendPort-safe (plain
+  /// JSON-ish maps/lists/scalars) because it crosses to the worker
+  /// isolate in the job payload.
+  ///
+  /// When the pool is not booted, `runAsync(...)` throws a clear JS error
+  /// on first use (dispatch sentinel) instead of failing the engine
+  /// wiring.
+  void attachMainRuntime(QuickjsRuntime runtime,
+      {AsyncDispatchContext? dispatchContext}) {
     runtime.registerHostFunction('__jsrDispatchHost', (argsJson) {
-      return _dispatchHost(argsJson);
+      return _dispatchHost(argsJson, context: dispatchContext);
     });
     runtime.registerHostFunction('__jsrWaitHost', (argsJson) {
       return _waitHost(argsJson);
@@ -431,7 +442,7 @@ class AsyncEnginePool {
   /// `__jsrDispatchHost` implementation: parses the JS call, captures the
   /// dispatch context, dispatches, and answers with the JSON job id — or a
   /// `{'__jsError': …}` sentinel the prelude rethrows.
-  String _dispatchHost(String argsJson) {
+  String _dispatchHost(String argsJson, {AsyncDispatchContext? context}) {
     try {
       final parsed = _parseDispatchArgs(argsJson);
       final error = parsed.error;
@@ -439,6 +450,7 @@ class AsyncEnginePool {
       final jobId = dispatch(
         fnSource: parsed.fnSource!,
         argsJson: parsed.argsJson!,
+        context: context?.call(),
       );
       return jsonEncode(jobId);
     } catch (e) {

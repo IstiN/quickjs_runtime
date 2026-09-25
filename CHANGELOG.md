@@ -1,3 +1,15 @@
+# Unreleased
+
+## Added
+
+- `AsyncEnginePool.attachMainRuntime` accepts a per-runtime
+  `dispatchContext` provider: the `runAsync` dispatch path now captures
+  context per main engine (overriding the pool-level default), so a
+  shared pool can serve main engines whose dispatch context differs per
+  engine (script directory, job params, ...). Explicit `dispatch(
+  context: ...)` still wins over both providers. Consumer-opaque,
+  must be SendPort-safe (plain JSON-ish values).
+
 # 0.3.3
 
 - Conformance fixture v2: byte-identical cross-runtime script with
