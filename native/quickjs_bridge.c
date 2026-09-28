@@ -11,6 +11,9 @@
  *     -lm -ldl -lpthread
  */
 
+#ifdef _WIN32
+#include <windows.h> /* Sleep/DWORD (qjs_sleep_ms) */
+#endif
 #include "quickjs.h"
 #include <stdio.h>
 #include <stdlib.h>
