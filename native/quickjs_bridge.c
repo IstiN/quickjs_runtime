@@ -260,3 +260,68 @@ int qjs_set_global_json(JSContext* ctx, const char* name, const char* json) {
     JS_FreeValue(ctx, global);
     return rc;
 }
+
+/* ── Bytes host functions ────────────────────────────────────────────
+ * A dedicated lane for high-frequency bulk data (per-frame transforms,
+ * particles, audio levels): JS passes a typed array, the bridge hands
+ * Dart the raw (pointer, length) pair with NO JSON marshal, NO string
+ * copies, NO base64. The data pointer is only valid for the duration
+ * of the callback. */
+
+typedef void (*BytesHostCallback)(const char* name, const uint8_t* data,
+                                  size_t len);
+
+static BytesHostCallback g_bytes_callbacks[MAX_HOST_FNS];
+static int g_bytes_callback_count = 0;
+
+static JSValue qjs_bytes_dispatch(JSContext* ctx, JSValueConst this_val,
+                                  int argc, JSValueConst* argv, int magic) {
+    (void)this_val;
+    int count = __atomic_load_n(&g_bytes_callback_count, __ATOMIC_ACQUIRE);
+    if (magic < 0 || magic >= count || !g_bytes_callbacks[magic]) {
+        return JS_ThrowTypeError(ctx, "invalid bytes callback index %d", magic);
+    }
+    if (argc < 2 || !JS_IsString(argv[0])) {
+        return JS_ThrowTypeError(ctx, "expected (name, typedArray)");
+    }
+    size_t offset = 0, length = 0;
+    JSValue buf = JS_GetTypedArrayBuffer(ctx, argv[1], &offset, &length, NULL);
+    if (JS_IsException(buf)) {
+        return JS_ThrowTypeError(ctx, "second argument must be a typed array");
+    }
+    size_t absize = 0;
+    uint8_t* ptr = JS_GetArrayBuffer(ctx, &absize, buf);
+    JS_FreeValue(ctx, buf);
+    if (!ptr) {
+        return JS_ThrowTypeError(ctx, "typed array has no backing buffer");
+    }
+    if (offset > absize || length > absize - offset) {
+        return JS_ThrowTypeError(ctx, "typed array range out of bounds");
+    }
+    const char* name = JS_ToCString(ctx, argv[0]);
+    if (name == NULL) {
+        return JS_ThrowTypeError(ctx, "failed to convert name");
+    }
+    g_bytes_callbacks[magic](name, ptr + offset, length);
+    JS_FreeCString(ctx, name);
+    return JS_UNDEFINED;
+}
+
+/* Register a bytes host function as a global JS function
+ * name(typedArray). Returns 0 on success, -1 on failure. */
+int qjs_register_bytes_fn(JSContext* ctx, const char* name,
+                          BytesHostCallback callback) {
+    if (g_bytes_callback_count >= MAX_HOST_FNS) return -1;
+    int idx = __sync_fetch_and_add(&g_bytes_callback_count, 1);
+    if (idx >= MAX_HOST_FNS) return -1;
+    g_bytes_callbacks[idx] = callback;
+
+    JSValue fn = JS_NewCFunction2(ctx, (JSCFunction*)qjs_bytes_dispatch, name,
+                                  0, JS_CFUNC_generic_magic, idx);
+    if (JS_IsException(fn)) return -1;
+
+    JSValue global = JS_GetGlobalObject(ctx);
+    int rc = JS_SetPropertyStr(ctx, global, name, fn);
+    JS_FreeValue(ctx, global);
+    return (rc < 0) ? -1 : 0;
+}

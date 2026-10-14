@@ -11,6 +11,7 @@ library;
 
 import 'dart:convert';
 import 'dart:ffi';
+import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
 
@@ -92,6 +93,40 @@ class QuickjsRuntime {
     _callables.add(callable); // keep alive so it isn't GC'd
     _ffi.registerHostFn(_context, name, callable.nativeFunction);
   }
+
+  /// Registers a BYTES host function callable from JS as `name(typedArray)`.
+  ///
+  /// The callback receives the name and a zero-copy view of the typed
+  /// array's bytes. It executes synchronously on the owning isolate and
+  /// the view is only valid for the duration of the call — copy
+  /// (`Uint8List.fromList`) if the data must outlive it. Returns false on
+  /// libraries built before the bytes export (0.3.4): callers should fall
+  /// back to the JSON/base64 path.
+  bool registerHostBytesFn(
+    String name,
+    void Function(String name, Uint8List data) callback,
+  ) {
+    if (!_ffi.hasBytesFn) return false;
+    final callable =
+        NativeCallable<Void Function(Pointer<Utf8>, Pointer<Uint8>, Size)>.isolateLocal((
+      Pointer<Utf8> namePtr,
+      Pointer<Uint8> dataPtr,
+      int length,
+    ) {
+      try {
+        callback(namePtr.toDartString(), dataPtr.asTypedList(length));
+      } catch (_) {
+        // isolateLocal callables cannot throw across the FFI boundary;
+        // degrade to a dropped message like the rest of the lane.
+      }
+    });
+    _callables.add(callable); // keep alive so it isn't GC'd
+    return _ffi.registerBytesFn(_context, name, callable.nativeFunction) == 0;
+  }
+
+  /// Whether this build of the native library supports bytes host
+  /// functions — see [registerHostBytesFn].
+  bool get hasBytesFn => _ffi.hasBytesFn;
 
   /// Sets a global variable named [name] from a Dart value (JSON-encoded).
   void setGlobal(String name, Object? value) {

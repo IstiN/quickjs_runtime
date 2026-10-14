@@ -22,6 +22,14 @@ import 'package:ffi/ffi.dart';
 /// The bridge frees the returned string with `free()`.
 typedef _HostCallbackNative = Pointer<Utf8> Function(Pointer<Utf8> argsJson);
 
+/// Bytes-lane host callback: `(name, data, length)`. `data` points into
+/// the JS typed array's backing store and is valid only during the call.
+typedef _BytesCallbackNative = Void Function(
+  Pointer<Utf8> name,
+  Pointer<Uint8> data,
+  Size length,
+);
+
 /// Resolves the absolute path to `libquickjs_bridge.so`.
 ///
 /// Looks in (1) the `JSR_QUICKJS_LIB` env var, (2) this package's checkout
@@ -111,6 +119,18 @@ class QuickjsFfi {
       _executePendingJobsCapped;
   late final int Function(int ms) _sleepMs;
 
+  /// Bytes-lane host functions (`qjs_register_bytes_fn`, added in 0.3.4).
+  /// Older shared libraries do not export it — [hasBytesFn] is false and
+  /// [registerBytesFn] degrades to a -1 no-op.
+  bool get hasBytesFn => _hasBytesFn;
+  bool _hasBytesFn = false;
+  late final int Function(
+    Pointer<Void> context,
+    Pointer<Utf8> name,
+    Pointer<NativeFunction<_BytesCallbackNative>> callback,
+  )
+  _registerBytesFn;
+
   /// Loads the shared library and resolves symbols.
   QuickjsFfi() {
     _lib = DynamicLibrary.open(libraryPath);
@@ -166,6 +186,23 @@ class QuickjsFfi {
     // Added after the bridge was first extracted; older builds (e.g. the
     // library dmtools-dart vendored before consuming this package) do not
     // export it. Degrade to a no-op so those binaries keep working.
+    if (_lib.providesSymbol('qjs_register_bytes_fn')) {
+      _registerBytesFn = _lib
+          .lookup<
+            NativeFunction<
+              Int32 Function(
+                Pointer<Void>,
+                Pointer<Utf8>,
+                Pointer<NativeFunction<_BytesCallbackNative>>,
+              )
+            >
+          >('qjs_register_bytes_fn')
+          .asFunction();
+      _hasBytesFn = true;
+    } else {
+      _registerBytesFn = (_, __, ___) => -1;
+    }
+
     if (_lib.providesSymbol('qjs_execute_pending_jobs')) {
       _executePendingJobs = _lib
           .lookup<NativeFunction<Int32 Function(Pointer<Void>)>>(
@@ -209,6 +246,24 @@ class QuickjsFfi {
 
   /// Resets the global host callback registry.
   void resetCallbacks() => _resetCallbacks();
+
+  /// Registers [callback] as a global JS BYTES function named [name].
+  ///
+  /// JS calls `name(typedArray)`; the C bridge hands Dart the raw
+  /// (name, pointer, length) with no JSON marshal. The data view is only
+  /// valid for the duration of the synchronous call — copy if retaining.
+  /// No-op returning -1 on libraries without the bytes export.
+  int registerBytesFn(
+    Pointer<Void> context,
+    String name,
+    Pointer<NativeFunction<_BytesCallbackNative>> callback,
+  ) {
+    if (!_hasBytesFn) return -1;
+    final namePtr = name.toNativeUtf8();
+    final rc = _registerBytesFn(context, namePtr, callback);
+    malloc.free(namePtr);
+    return rc;
+  }
 
   /// Registers [callback] as a global JS function named [name].
   ///
