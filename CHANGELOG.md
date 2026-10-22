@@ -1,3 +1,9 @@
+# 0.4.1
+
+- Widen `code_assets` (`>=1.2.0 <3.0.0`) and `hooks` (`>=1.0.0 <3.0.0`)
+  constraints so apps pinning `code_assets ^1.2.0` (e.g.
+  `flutter_gemma_litertlm`) resolve cleanly without changing their lockfile.
+
 # 0.4.0
 
 - **Dart & Flutter Native Assets (`hook/build.dart`)**: `quickjs_runtime`
