@@ -9,6 +9,7 @@
 ///
 /// This file is VM-only (dart:ffi); never import it from a web-reachable
 /// path.
+@DefaultAsset('package:quickjs_runtime/src/quickjs_ffi.dart')
 library;
 
 import 'dart:convert';
@@ -66,20 +67,101 @@ List<String>? _packageCheckoutPaths() {
     final packages =
         (jsonDecode(config.readAsStringSync()) as Map)['packages'] as List;
     for (final pkg in packages.cast<Map>()) {
-      if (pkg['name'] != 'quickjs_runtime') continue;
-      final root = Uri.parse(pkg['rootUri'] as String);
-      if (!root.isScheme('file')) continue;
-      // Hosted checkouts have no trailing slash in rootUri; git checkouts
-      // do. Normalize so the join always produces a valid path.
-      var rootPath = Uri.decodeComponent(root.path);
-      if (!rootPath.endsWith('/')) rootPath = '$rootPath/';
-      roots.add('${rootPath}native/quickjs/libquickjs_bridge.so');
+      final libPath = _packageLibPath(pkg);
+      if (libPath != null) roots.add(libPath);
     }
   } catch (_) {
     return null;
   }
   return roots.isEmpty ? null : roots;
 }
+
+String? _packageLibPath(Map pkg) {
+  if (pkg['name'] != 'quickjs_runtime') return null;
+  final root = Uri.parse(pkg['rootUri'] as String);
+  if (!root.isScheme('file')) return null;
+  var rootPath = Uri.decodeComponent(root.path);
+  if (!rootPath.endsWith('/')) rootPath = '$rootPath/';
+  return '${rootPath}native/quickjs/libquickjs_bridge.so';
+}
+
+const _symRegisterBytesFn = 'qjs_register_bytes_fn';
+const _symExecutePendingJobs = 'qjs_execute_pending_jobs';
+const _symExecutePendingJobsCapped = 'qjs_execute_pending_jobs_capped';
+const _symSleepMs = 'qjs_sleep_ms';
+
+@Native<Pointer<Void> Function()>(symbol: 'qjs_create_runtime')
+external Pointer<Void> _nativeCreateRuntime();
+
+@Native<Pointer<Void> Function(Pointer<Void>)>(symbol: 'qjs_create_context')
+external Pointer<Void> _nativeCreateContext(Pointer<Void> runtime);
+
+@Native<Void Function(Pointer<Void>, Pointer<Void>)>(symbol: 'qjs_destroy')
+external void _nativeDestroy(Pointer<Void> runtime, Pointer<Void> context);
+
+@Native<Void Function()>(symbol: 'qjs_reset_callbacks')
+external void _nativeResetCallbacks();
+
+@Native<
+    Int32 Function(
+      Pointer<Void>,
+      Pointer<Utf8>,
+      Pointer<NativeFunction<_HostCallbackNative>>,
+    )>(symbol: 'qjs_register_host_fn')
+external int _nativeRegisterHostFn(
+  Pointer<Void> context,
+  Pointer<Utf8> name,
+  Pointer<NativeFunction<_HostCallbackNative>> callback,
+);
+
+@Native<
+    Pointer<Utf8> Function(
+      Pointer<Void>,
+      Pointer<Utf8>,
+      Pointer<Utf8>,
+      Pointer<Pointer<Utf8>>,
+    )>(symbol: 'qjs_eval')
+external Pointer<Utf8> _nativeEval(
+  Pointer<Void> context,
+  Pointer<Utf8> code,
+  Pointer<Utf8> filename,
+  Pointer<Pointer<Utf8>> errMsg,
+);
+
+@Native<Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>)>(
+  symbol: 'qjs_set_global_json',
+)
+external int _nativeSetGlobalJson(
+  Pointer<Void> context,
+  Pointer<Utf8> name,
+  Pointer<Utf8> json,
+);
+
+@Native<
+    Int32 Function(
+      Pointer<Void>,
+      Pointer<Utf8>,
+      Pointer<NativeFunction<_BytesCallbackNative>>,
+    )>(symbol: _symRegisterBytesFn)
+external int _nativeRegisterBytesFn(
+  Pointer<Void> context,
+  Pointer<Utf8> name,
+  Pointer<NativeFunction<_BytesCallbackNative>> callback,
+);
+
+@Native<Int32 Function(Pointer<Void>)>(symbol: _symExecutePendingJobs)
+external int _nativeExecutePendingJobs(Pointer<Void> context);
+
+@Native<Int32 Function(Pointer<Void>, Int32)>(
+  symbol: _symExecutePendingJobsCapped,
+)
+external int _nativeExecutePendingJobsCapped(
+  Pointer<Void> context,
+  int maxJobs,
+);
+
+@Native<Int32 Function(Int32)>(symbol: _symSleepMs)
+external int _nativeSleepMs(int ms);
 
 /// Low-level QuickJS FFI bindings.
 ///
@@ -91,7 +173,17 @@ class QuickjsFfi {
   /// Path to the shared library, overridable for tests.
   static String libraryPath = _resolveLibraryPath();
 
-  late final DynamicLibrary _lib;
+  /// True when either the native-assets build hook (`hook/build.dart`) or
+  /// a pre-built `libquickjs_bridge.so` is available.
+  static bool get isAvailable {
+    if (File(libraryPath).existsSync()) return true;
+    try {
+      _nativeResetCallbacks();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
 
   late final Pointer<Void> Function() _createRuntime;
   late final Pointer<Void> Function(Pointer<Void> runtime) _createContext;
@@ -128,34 +220,59 @@ class QuickjsFfi {
     Pointer<Void> context,
     Pointer<Utf8> name,
     Pointer<NativeFunction<_BytesCallbackNative>> callback,
-  )
-  _registerBytesFn;
+  ) _registerBytesFn;
 
-  /// Loads the shared library and resolves symbols.
-  QuickjsFfi() {
-    _lib = DynamicLibrary.open(libraryPath);
+  /// Resolves QuickJS C bridge symbols via the native-assets `CodeAsset`
+  /// (`hook/build.dart`) when available, or falls back to opening
+  /// [libraryPath] (`JSR_QUICKJS_LIB` / `tool/build_quickjs.sh`).
+  QuickjsFfi({bool preferDynamicLibrary = false}) {
+    final envOverride = Platform.environment['JSR_QUICKJS_LIB'];
+    if (!preferDynamicLibrary &&
+        (envOverride == null || envOverride.isEmpty)) {
+      try {
+        _nativeResetCallbacks();
+        _bindNativeAsset();
+        return;
+      } catch (_) {
+        // Fall through to DynamicLibrary.open(libraryPath).
+      }
+    }
+    _bindDynamicLibrary(DynamicLibrary.open(libraryPath));
+  }
 
-    _createRuntime = _lib
+  void _bindNativeAsset() {
+    _createRuntime = _nativeCreateRuntime;
+    _createContext = _nativeCreateContext;
+    _destroy = _nativeDestroy;
+    _resetCallbacks = _nativeResetCallbacks;
+    _registerHostFn = _nativeRegisterHostFn;
+    _eval = _nativeEval;
+    _setGlobalJson = _nativeSetGlobalJson;
+    _registerBytesFn = _nativeRegisterBytesFn;
+    _hasBytesFn = true;
+    _executePendingJobs = _nativeExecutePendingJobs;
+    _executePendingJobsCapped = _nativeExecutePendingJobsCapped;
+    _sleepMs = _nativeSleepMs;
+  }
+
+  void _bindDynamicLibrary(DynamicLibrary lib) {
+    _createRuntime = lib
         .lookup<NativeFunction<Pointer<Void> Function()>>('qjs_create_runtime')
         .asFunction();
-
-    _createContext = _lib
+    _createContext = lib
         .lookup<NativeFunction<Pointer<Void> Function(Pointer<Void>)>>(
           'qjs_create_context',
         )
         .asFunction();
-
-    _destroy = _lib
+    _destroy = lib
         .lookup<NativeFunction<Void Function(Pointer<Void>, Pointer<Void>)>>(
           'qjs_destroy',
         )
         .asFunction();
-
-    _resetCallbacks = _lib
+    _resetCallbacks = lib
         .lookup<NativeFunction<Void Function()>>('qjs_reset_callbacks')
         .asFunction();
-
-    _registerHostFn = _lib
+    _registerHostFn = lib
         .lookup<
             NativeFunction<
                 Int32 Function(
@@ -164,8 +281,7 @@ class QuickjsFfi {
                   Pointer<NativeFunction<_HostCallbackNative>>,
                 )>>('qjs_register_host_fn')
         .asFunction();
-
-    _eval = _lib
+    _eval = lib
         .lookup<
             NativeFunction<
                 Pointer<Utf8> Function(
@@ -175,19 +291,20 @@ class QuickjsFfi {
                   Pointer<Pointer<Utf8>>,
                 )>>('qjs_eval')
         .asFunction();
-
-    _setGlobalJson = _lib
+    _setGlobalJson = lib
         .lookup<
             NativeFunction<
-                Int32 Function(Pointer<Void>, Pointer<Utf8>,
-                    Pointer<Utf8>)>>('qjs_set_global_json')
+                Int32 Function(
+                    Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>)>>(
+          'qjs_set_global_json',
+        )
         .asFunction();
+    _bindOptionalSymbols(lib);
+  }
 
-    // Added after the bridge was first extracted; older builds (e.g. the
-    // library dmtools-dart vendored before consuming this package) do not
-    // export it. Degrade to a no-op so those binaries keep working.
-    if (_lib.providesSymbol('qjs_register_bytes_fn')) {
-      _registerBytesFn = _lib
+  void _bindOptionalSymbols(DynamicLibrary lib) {
+    if (lib.providesSymbol(_symRegisterBytesFn)) {
+      _registerBytesFn = lib
           .lookup<
             NativeFunction<
               Int32 Function(
@@ -196,38 +313,33 @@ class QuickjsFfi {
                 Pointer<NativeFunction<_BytesCallbackNative>>,
               )
             >
-          >('qjs_register_bytes_fn')
+          >(_symRegisterBytesFn)
           .asFunction();
       _hasBytesFn = true;
     } else {
       _registerBytesFn = (_, __, ___) => -1;
     }
-
-    if (_lib.providesSymbol('qjs_execute_pending_jobs')) {
-      _executePendingJobs = _lib
+    if (lib.providesSymbol(_symExecutePendingJobs)) {
+      _executePendingJobs = lib
           .lookup<NativeFunction<Int32 Function(Pointer<Void>)>>(
-            'qjs_execute_pending_jobs',
+            _symExecutePendingJobs,
           )
           .asFunction();
     } else {
       _executePendingJobs = (_) => 0;
     }
-
-    // Additive, newer-build symbols (see the doc comments on the public
-    // wrappers). Degrade to equivalents that keep older .so binaries working:
-    // uncapped pending-job drain and a no-op sleep.
-    if (_lib.providesSymbol('qjs_execute_pending_jobs_capped')) {
-      _executePendingJobsCapped = _lib
+    if (lib.providesSymbol(_symExecutePendingJobsCapped)) {
+      _executePendingJobsCapped = lib
           .lookup<NativeFunction<Int32 Function(Pointer<Void>, Int32)>>(
-            'qjs_execute_pending_jobs_capped',
+            _symExecutePendingJobsCapped,
           )
           .asFunction();
     } else {
       _executePendingJobsCapped = (context, _) => _executePendingJobs(context);
     }
-    if (_lib.providesSymbol('qjs_sleep_ms')) {
-      _sleepMs = _lib
-          .lookup<NativeFunction<Int32 Function(Int32)>>('qjs_sleep_ms')
+    if (lib.providesSymbol(_symSleepMs)) {
+      _sleepMs = lib
+          .lookup<NativeFunction<Int32 Function(Int32)>>(_symSleepMs)
           .asFunction();
     } else {
       _sleepMs = (_) => -1;
