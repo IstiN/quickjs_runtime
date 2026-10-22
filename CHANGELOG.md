@@ -1,3 +1,10 @@
+# 0.4.2
+
+- `hook/build.dart`: pass `-Wl,-z,max-page-size=16384` on Android (Google
+  Play 16 KB page-size alignment gate) and `-headerpad_max_install_names` +
+  `-install_name @rpath/libquickjs_bridge.dylib` on iOS/macOS (App Store
+  Connect / TestFlight framework embedding and codesign reproducibility).
+
 # 0.4.1
 
 - Widen `code_assets` (`>=1.2.0 <3.0.0`) and `hooks` (`>=1.0.0 <3.0.0`)

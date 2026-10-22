@@ -32,10 +32,16 @@ void main(List<String> args) async {
       },
       flags: isWindows
           ? const []
-          : const [
+          : [
               '-Wno-implicit-const-int-float-conversion',
               '-Wno-unused-parameter',
               '-Wno-sign-compare',
+              if (os == OS.android) '-Wl,-z,max-page-size=16384',
+              if (os == OS.iOS || os == OS.macOS) ...[
+                '-headerpad_max_install_names',
+                '-install_name',
+                '@rpath/libquickjs_bridge.dylib',
+              ],
             ],
       libraries: isWindows
           ? const []
