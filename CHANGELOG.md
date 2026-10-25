@@ -1,3 +1,10 @@
+# 0.4.5
+
+- **Windows (MSVC) build fix, part 3**: neutralize the single-trailing-underscore
+  GCC spelling  (used by upstream on ) in the
+  shim, and use  instead of  under  (C2124).
+  After 0.4.4 the full MSVC compile is down to these two diagnostics.
+
 # 0.4.4
 
 - **Windows (MSVC) build fix, part 2**: force `DIRECT_DISPATCH 0` for

@@ -33,6 +33,11 @@
 #ifndef __attribute__
 #define __attribute__(x)
 #endif
+/* GCC also accepts the single-trailing-underscore spelling
+   (quickjs.c uses __attribute((unused)) on dump_token). */
+#ifndef __attribute
+#define __attribute(x)
+#endif
 
 /* 2. intrinsics: _BitScanReverse / _BitScanForward (cutils.h),
    _AddressOfReturnAddress (quickjs.c), _Interlocked* (below). */
