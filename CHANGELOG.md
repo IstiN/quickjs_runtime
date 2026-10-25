@@ -1,3 +1,17 @@
+# 0.4.4
+
+- **Windows (MSVC) build fix, part 2**: force `DIRECT_DISPATCH 0` for
+  `_MSC_VER` (quickjs.c) — MSVC has no computed goto / labels-as-values,
+  so `JS_CallInternal` uses the plain `switch` dispatch (same as the
+  Emscripten build; identical semantics, slightly slower interpreter).
+  Add `ssize_t` (`intptr_t`) to the MSVC shim (`msvc_compat.h`); MSVC has
+  no POSIX `ssize_t`, which broke `JS_DumpMemoryUsage`.
+- Verification upgraded from a plain-clang `_MSC_VER` simulation (which
+  silently accepts GNU extensions such as labels-as-values) to
+  **clang-cl `/Zs`** (MSVC driver mode from Homebrew LLVM) over all six
+  translation units plus a standalone harness for the `sys/time.h` shim:
+  0 errors.
+
 # 0.4.3
 
 - **Windows (MSVC) build fix**: `native_toolchain_c` resolves `cl.exe` on

@@ -48,7 +48,10 @@
 
 #define OPTIMIZE         1
 #define SHORT_OPCODES    1
-#if defined(EMSCRIPTEN)
+#if defined(EMSCRIPTEN) || defined(_MSC_VER)
+/* MSVC has no labels-as-values (computed goto); use the plain switch
+   dispatch. Same tradeoff as Emscripten: slightly slower interpreter,
+   identical semantics. */
 #define DIRECT_DISPATCH  0
 #else
 #define DIRECT_DISPATCH  1

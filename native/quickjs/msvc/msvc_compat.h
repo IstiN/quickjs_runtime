@@ -36,6 +36,11 @@
 
 /* 2. intrinsics: _BitScanReverse / _BitScanForward (cutils.h),
    _AddressOfReturnAddress (quickjs.c), _Interlocked* (below). */
+/* clang-cl in MSVC-emulation mode accepts __forceinline; plain clang
+   (e.g. simulating _MSC_VER on a non-Windows host) does not. */
+#if defined(__clang__) && !defined(__forceinline)
+#define __forceinline inline
+#endif
 #include <intrin.h>
 
 /* 3. alloca: MSVC declares _alloca in <malloc.h> and does not provide
@@ -78,6 +83,13 @@ static __forceinline int qjs_atomic_fetch_add_int(volatile int *p, int delta)
     qjs_atomic_load_acquire((volatile int *)(ptr))
 #define __sync_fetch_and_add(ptr, delta) \
     qjs_atomic_fetch_add_int((volatile int *)(ptr), (int)(delta))
+
+/* 7. ssize_t: POSIX signed size type not provided by MSVC. */
+#include <stdint.h>
+#ifndef _SSIZE_T_DEFINED
+#define _SSIZE_T_DEFINED
+typedef intptr_t ssize_t;
+#endif
 
 #endif /* _MSC_VER */
 #endif /* QUICKJS_MSVC_COMPAT_H */
