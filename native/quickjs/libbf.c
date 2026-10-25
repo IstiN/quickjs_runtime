@@ -3105,7 +3105,14 @@ static int bf_atof_internal(bf_t *r, slimb_t *pexponent,
     if (is_dec) {
         a->expn = expn + int_len;
         a->sign = is_neg;
+#ifdef USE_BF_DEC
+        /* Decimal support (CONFIG_BIGNUM builds) only; is_dec is never
+           TRUE otherwise (bfdec_atof, the sole TRUE caller, is guarded
+           by USE_BF_DEC). Without the guard MSVC links fail with an
+           unresolved bfdec_normalize_and_round (macOS ld silently
+           tolerates the same dangling reference in a dylib). */
         ret = bfdec_normalize_and_round((bfdec_t *)a, prec, flags);
+#endif
     } else if (radix_bits) {
         /* XXX: may overflow */
         if (!is_bin_exp)

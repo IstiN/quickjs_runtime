@@ -1,3 +1,13 @@
+# 0.4.7
+
+- **Windows (MSVC) link fix**:  called
+   unconditionally, but the decimal support
+  (, i.e. CONFIG_BIGNUM) is not compiled — MS linker fails
+  with LNK2019 (macOS  silently tolerates the dangling reference in
+  a dylib, which is why it went unnoticed). The call is now guarded by
+  ;  is never TRUE on that path without it (the sole
+  TRUE caller, , is itself guarded). Zero behavior change.
+
 # 0.4.6
 
 - **Windows (MSVC) build fix, part 4**: use -HUGE_VAL / HUGE_VAL instead of
