@@ -49,12 +49,16 @@ Object? evalJson(QuickjsRuntime rt, String code) {
 /// worker wiring and the Java worker-bridge wiring, which both build a
 /// fresh engine per dispatched job).
 ///
-/// A runtime created at worker START and then used while the MAIN
-/// isolate sits inside its own `rt.eval` intermittently evaluates even
-/// `1+1` to `undefined` (silent, no errMsg) — QuickJS-level race between
-/// the two isolates' C frames. Creating the engine per job, while the
-/// main isolate is parked in the native `wait()`, is clean (0/30) and
-/// matches the production adapter's fresh-engine-per-job contract.
+/// Engine lifetime note: the engines here are built per job purely to
+/// mirror the production adapter's fresh-engine-per-job contract. The
+/// historical "runtime created at worker start intermittently evaluates
+/// to undefined" flake was NOT an engine-shape problem: the Dart VM
+/// migrates an isolate between OS threads, and QuickJS anchors its
+/// stack-overflow limit to the thread that created the runtime — an eval
+/// on a migrated thread spuriously failed with SyntaxError("stack
+/// overflow"), whose message then failed to render, surfacing as a
+/// silent undefined. The bridge now re-anchors the stack top at every
+/// JS entry point (qjs_refresh_stack_top in quickjs_bridge.c).
 Future<void> compatWorkerMain(AsyncWorkerLink link) async {
   try {
     while (true) {

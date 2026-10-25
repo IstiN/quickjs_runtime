@@ -1,3 +1,21 @@
+# 0.4.8
+
+- **Fix the ubuntu CI isolate flake (silent `undefined` evals)**: the Dart
+  VM migrates an isolate to a different OS thread once it is not pinned
+  inside an FFI call. QuickJS anchors its stack-overflow limit
+  (`rt->stack_top - stack_size`) to the thread that created the runtime,
+  so an eval running on a migrated thread compared its stack pointer
+  against an unrelated address range and failed at parse time with a
+  spurious `SyntaxError: stack overflow`. Rendering that error overflows
+  again, so `JS_ToCString` returned NULL and the failure surfaced as a
+  silent `undefined`/`null` eval result — the intermittent
+  `async_engine_pool` / `cross_runtime_conformance` failures on
+  ubuntu-latest. The bridge now calls `JS_UpdateStackTop` at every JS
+  entry point (`qjs_eval`, `qjs_execute_pending_jobs[_capped]`), which
+  Dart's one-runtime-per-isolate discipline makes race-free. Verified via
+  CI instrumentation on the failing runner: the wedged exception reads
+  `SyntaxError: stack overflow` at eval depth 0.
+
 # 0.4.7
 
 - **Windows (MSVC) link fix**:  called

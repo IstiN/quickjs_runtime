@@ -36,6 +36,23 @@ static int g_callback_count = 0;
 
 /* ── Dispatch: the single C function all registered host fns call ──── */
 
+/* Re-anchor QuickJS's stack limit to the CURRENT thread before any JS
+ * can run. QuickJS captures rt->stack_top once, in JS_NewRuntime, on
+ * whatever OS thread created the runtime, and every JS call checks
+ * the machine SP against stack_top - stack_size. The Dart VM freely
+ * migrates an isolate to a different OS thread once it is not pinned
+ * inside an FFI call, so an eval can run on a thread whose stack sits
+ * at an unrelated address: the stale comparison then fails at parse
+ * time with a spurious SyntaxError("stack overflow") — and rendering
+ * that error overflows again, so the failure surfaces upstream as a
+ * SILENT undefined/null eval result (the ubuntu CI flake). Dart
+ * isolates never execute one runtime on two threads simultaneously
+ * (each engine is owned by exactly one isolate; see async_engine_pool),
+ * so re-capturing here is race-free. */
+static void qjs_refresh_stack_top(JSContext* ctx) {
+    JS_UpdateStackTop(JS_GetRuntime(ctx));
+}
+
 static JSValue qjs_dispatch(JSContext* ctx, JSValueConst this_val,
                             int argc, JSValueConst* argv, int magic) {
     (void)this_val;
@@ -142,6 +159,8 @@ char* qjs_eval(JSContext* ctx, const char* code, const char* filename,
                char** err_msg) {
     if (err_msg) *err_msg = NULL;
 
+    qjs_refresh_stack_top(ctx);
+
     JSValue val = JS_Eval(ctx, code, strlen(code),
                           filename ? filename : "<eval>",
                           JS_EVAL_TYPE_GLOBAL);
@@ -185,6 +204,7 @@ char* qjs_eval(JSContext* ctx, const char* code, const char* filename,
  * jobs, or -1 if a job raised an exception (reported on stderr, cleared). */
 int qjs_execute_pending_jobs(JSContext* ctx) {
     JSRuntime* rt = JS_GetRuntime(ctx);
+    qjs_refresh_stack_top(ctx);
     int executed = 0;
     for (;;) {
         JSContext* ctx1;
@@ -212,6 +232,7 @@ int qjs_execute_pending_jobs(JSContext* ctx) {
  * on stderr, cleared). */
 int qjs_execute_pending_jobs_capped(JSContext* ctx, int max_jobs) {
     JSRuntime* rt = JS_GetRuntime(ctx);
+    qjs_refresh_stack_top(ctx);
     int executed = 0;
     for (;;) {
         JSContext* ctx1;
