@@ -25,7 +25,18 @@ void main(List<String> args) async {
         'native/quickjs/cutils.c',
         'native/quickjs/libbf.c',
       ],
-      includes: const ['native/quickjs'],
+      // On Windows the MSVC toolchain (native_toolchain_c resolves cl.exe)
+      // cannot compile the vendored GCC-oriented QuickJS sources as-is.
+      // native/quickjs/msvc provides a forced-include compatibility shim
+      // (sys/time.h, alloca, strdup, atomics, intrinsics) plus a shim
+      // include dir that satisfies quickjs.c's <sys/time.h>. Other
+      // platforms are untouched.
+      includes: isWindows
+          ? const ['native/quickjs/msvc', 'native/quickjs']
+          : const ['native/quickjs'],
+      forcedIncludes: isWindows
+          ? const ['native/quickjs/msvc/msvc_compat.h']
+          : const [],
       defines: const {
         '_GNU_SOURCE': null,
         'CONFIG_VERSION': '"2024-01-13"',

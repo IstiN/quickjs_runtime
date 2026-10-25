@@ -1,3 +1,20 @@
+# 0.4.3
+
+- **Windows (MSVC) build fix**: `native_toolchain_c` resolves `cl.exe` on
+  GitHub Actions `windows-latest`, which cannot compile the vendored
+  GCC-oriented QuickJS 2024-01-13 sources directly. On Windows only, the
+  build hook now force-includes `native/quickjs/msvc/msvc_compat.h`
+  (`sys/time.h` + `gettimeofday` shim, `alloca`/`strdup`, GCC atomic
+  builtins on `_Interlocked*` intrinsics, `isnan`/`isfinite`, GNU
+  `__attribute__` neutralized) and prepends `native/quickjs/msvc` to the
+  include path. The vendored sources gained `_MSC_VER`-guarded branches
+  (compound-literal-free `JS_MKVAL`/`JS_MKPTR`/`JS_NAN` constructors,
+  packed structs via `#pragma pack`, `clz`/`ctz` via `_BitScanReverse`,
+  stack-pointer probe via `_AddressOfReturnAddress`); clang/GCC builds see
+  zero changes. Tradeoff: on Windows, `Atomics.*`/`SharedArrayBuffer`
+  futex-style waiting stays disabled (it requires pthreads), matching
+  single-threaded QuickJS builds.
+
 # 0.4.2
 
 - `hook/build.dart`: pass `-Wl,-z,max-page-size=16384` on Android (Google
