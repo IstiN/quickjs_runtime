@@ -42971,7 +42971,12 @@ static JSValue js_math_min_max(JSContext *ctx, JSValueConst this_val,
     uint32_t tag;
 
     if (unlikely(argc == 0)) {
+#ifdef _MSC_VER
+        /* MSVC rejects 1.0/0.0 in a constant expression (C2124). */
+        return __JS_NewFloat64(ctx, is_max ? -HUGE_VAL : HUGE_VAL);
+#else
         return __JS_NewFloat64(ctx, is_max ? -1.0 / 0.0 : 1.0 / 0.0);
+#endif
     }
 
     tag = JS_VALUE_GET_TAG(argv[0]);

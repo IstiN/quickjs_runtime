@@ -1,3 +1,9 @@
+# 0.4.6
+
+- **Windows (MSVC) build fix, part 4**: use -HUGE_VAL / HUGE_VAL instead of
+  -1.0 / 0.0 and 1.0 / 0.0 in js_math_min_max (C2124). After 0.4.5 the MSVC
+  compile reports exactly this one diagnostic.
+
 # 0.4.5
 
 - **Windows (MSVC) build fix, part 3**: neutralize the single-trailing-underscore
